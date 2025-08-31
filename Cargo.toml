@@ -12,6 +12,7 @@ wit-bindgen = "0.45"
 wit-component = "0.238"
 tokio = { version = "1.0", features = ["full"] }
 anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
 
 [build-dependencies]
 wit-bindgen = "0.45"

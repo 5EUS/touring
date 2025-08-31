@@ -1,0 +1,32 @@
+use clap::{Parser, Subcommand};
+
+/// Extensible CLI for debugging and development
+#[derive(Parser)]
+#[command(name = "touring")]
+#[command(about = "A CLI tool for managing plugins and sources", long_about = None)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    /// List all available plugins
+    Plugins {
+        /// Filter plugins by name
+        #[arg(short, long)]
+        name: Option<String>,
+    },
+    /// Interact with sources
+    Source {
+        /// Fetch manga list by query
+        #[arg(short, long)]
+        query: Option<String>,
+    },
+    /// Debug a specific module
+    Debug {
+        /// Module name to debug
+        #[arg(short, long)]
+        module: String,
+    },
+}
