@@ -1,58 +1,110 @@
-pub mod wasmsource
-{
-    use anyhow::Result;
-    use wasmtime::{Engine, Module, Store, Linker, Instance};
+pub mod wasmsource {
+    use anyhow::{Context, Result};
+    use wasmtime::{component::*, *};
+    use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+
+    // Generate bindings for the WIT world
+    wasmtime::component::bindgen!({
+        world: "source",
+        // Use the wit folder so package imports resolve
+        path: "wit/",
+    });
+
+    // Minimal host context with WASI + resource table for component model
+    struct Host {
+        wasi: WasiCtx,
+        table: ResourceTable,
+    }
+
+    impl WasiView for Host {
+        fn ctx(&mut self) -> &mut WasiCtx {
+            &mut self.wasi
+        }
+        fn table(&mut self) -> &mut ResourceTable {
+            &mut self.table
+        }
+    }
+
+    // Type aliases for easier use
+    pub type WasmManga = Media;
+    pub type WasmEpisode = Episode;
+    pub type WasmMediaStream = Mediastream;
 
     pub struct WasmSource {
-        instance: Instance,
-        store: Store<()>,
+        store: Store<Host>,
+        bindings: Source,
+        _instance: wasmtime::component::Instance,
+        _component: Component,
     }
 
     impl WasmSource {
-        pub fn new(wasm_path: &str) -> Result<Self> {
-            let engine = Engine::default();
-            let module = Module::from_file(&engine, wasm_path)?;
-            let mut store = Store::new(&engine, ());
-            let linker = Linker::new(&engine);
-            let instance = linker.instantiate(&mut store, &module)?;
-            Ok(Self { instance, store })
-        }
-        
-        pub fn call_fetch_list(&mut self, query: &str) -> Result<String> {
-            // Get the memory export from the instance
-            let memory = self
-                .instance
-                .get_memory(&mut self.store, "memory")
-                .ok_or_else(|| anyhow::anyhow!("Failed to find memory export"))?;
+        pub fn new(engine: &Engine, wasm_path: &str) -> Result<Self> {
+            // Load component (not a core module)
+            let component = Component::from_file(engine, wasm_path)
+                .with_context(|| format!("failed to load component: {}", wasm_path))?;
 
-            // Allocate memory for the query string
-            let query_bytes = query.as_bytes();
-            let query_len = query_bytes.len() as i32;
+            // Build WASI + host
+            let wasi = WasiCtxBuilder::new()
+                .inherit_stdio()
+                .inherit_args() // unwrap Result before build()
+                .build();
+            let table = ResourceTable::new();
+            let host = Host { wasi, table };
 
-            // Assume the WebAssembly module has an `alloc` function to allocate memory
-            let alloc_func = self
-                .instance
-                .get_typed_func::<i32, i32>(&mut self.store, "alloc")?;
-            let query_ptr = alloc_func.call(&mut self.store, query_len)?;
+            // Store and linker
+            let mut store = Store::new(engine, host);
+            let mut linker = wasmtime::component::Linker::<Host>::new(engine);
+            wasmtime_wasi::add_to_linker_sync(&mut linker)?;
 
-            // Write the query string into the allocated memory
-            memory.write(&mut self.store, query_ptr as usize, query_bytes)?;
+            // Instantiate via generated bindings (returns (bindings, instance))
+            let instance = linker.instantiate(&mut store, &component)
+                .context("failed to instantiate component")?;
+            let bindings = Source::new(&mut store, &instance)
+                .context("failed to create component bindings")?;
 
-            // Call the `fetch_list` function with the query pointer and length
-            let fetch_list_func = self
-                .instance
-                .get_typed_func::<(i32, i32), i32>(&mut self.store, "fetch_list")?;
-            let result_ptr = fetch_list_func.call(&mut self.store, (query_ptr, query_len))?;
-
-            // Read the result string from memory
-            let mut result_buffer = vec![0u8; 1024]; // Assume a max result size of 1024 bytes
-            memory.read(&mut self.store, result_ptr as usize, &mut result_buffer)?;
-
-            // Convert the result buffer to a string
-            let result = String::from_utf8(result_buffer)?.trim_end_matches('\0').to_string();
-
-            Ok(result)
+            Ok(Self {
+                store,
+                bindings,
+                _instance: instance,
+                _component: component,
+            })
         }
 
+        // Manga methods
+        pub fn call_fetch_manga_list(&mut self, query: &str) -> Result<Vec<WasmManga>> {
+            self.bindings
+                .call_fetchmangalist(&mut self.store, query)
+                .context("failed to call fetchmangalist")
+        }
+
+        pub fn call_fetch_chapter_images(&mut self, chapter_id: &str) -> Result<Vec<String>> {
+            self.bindings
+                .call_fetchchapterimages(&mut self.store, chapter_id)
+                .context("failed to call fetchchapterimages")
+        }
+
+        // Anime methods
+        pub fn call_fetch_anime_list(&mut self, query: &str) -> Result<Vec<WasmManga>> {
+            self.bindings
+                .call_fetchanimelist(&mut self.store, query)
+                .context("failed to call fetchanimelist")
+        }
+
+        pub fn call_fetch_anime_episodes(&mut self, anime_id: &str) -> Result<Vec<WasmEpisode>> {
+            self.bindings
+                .call_fetchanimeepisodes(&mut self.store, anime_id)
+                .context("failed to call fetchanimeepisodes")
+        }
+
+        pub fn call_fetch_episode_streams(&mut self, episode_id: &str) -> Result<Vec<WasmMediaStream>> {
+            self.bindings
+                .call_fetchepisodestreams(&mut self.store, episode_id)
+                .context("failed to call fetchepisodestreams")
+        }
+
+        // Legacy method for backwards compatibility
+        pub fn call_fetch_list(&mut self, query: &str) -> Result<Vec<WasmManga>> {
+            self.call_fetch_manga_list(query)
+        }
     }
 }

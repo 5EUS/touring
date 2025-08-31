@@ -2,16 +2,52 @@ package touring:source;
 
 world source {
   /// Fetch a list of manga by query
-  export fetchmangalist: func(query: string) -> list<manga>;
+  export fetchmangalist: func(query: string) -> list<media>;
 
   /// Fetch all image URLs for a given chapter
   export fetchchapterimages: func(chapterid: string) -> list<string>;
 
-  record manga {
+  /// Fetch a list of anime by query
+  export fetchanimelist: func(query: string) -> list<media>;
+
+  /// Fetch all episodes for a given anime id
+  export fetchanimeepisodes: func(animeid: string) -> list<episode>;
+
+  /// Fetch available stream URLs for a given episode id
+  export fetchepisodestreams: func(episodeid: string) -> list<mediastream>;
+
+  variant media-type {
+    anime,
+    manga,
+    other(string),
+  }
+
+  record media {
     id: string,
+    mediatype: media-type,
     title: string,
     description: option<string>,
     url: option<string>,
+  }
+
+  /// Describes an anime episode
+  record episode {
+    id: string,
+    title: string,
+    /// Optional numeric episode number (e.g. 1, 12.5)
+    number: option<f32>,
+    /// Optional link to the episode page on the provider
+    url: option<string>,
+  }
+
+  /// Describes a playable stream
+  record mediastream {
+    /// Direct or playlist URL (e.g. m3u8)
+    url: string,
+    /// Optional quality label (e.g. "1080p", "720p")
+    quality: option<string>,
+    /// Optional MIME type (e.g. "application/vnd.apple.mpegurl", "video/mp4")
+    mime: option<string>,
   }
 }
 
