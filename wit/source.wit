@@ -1,0 +1,18 @@
+package touring:source;
+
+world source {
+  /// Fetch a list of manga by query
+  export fetchmangalist: func(query: string) -> list<manga>;
+
+  /// Fetch all image URLs for a given chapter
+  export fetchchapterimages: func(chapterid: string) -> list<string>;
+
+  record manga {
+    id: string,
+    title: string,
+    description: option<string>,
+    url: option<string>,
+  }
+}
+
+

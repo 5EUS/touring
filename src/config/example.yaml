@@ -1,0 +1,9 @@
+name: Example Video Source
+base_url: "https://example.com"
+list_endpoint: "/videos"
+detail_endpoint: "/videos/{id}"
+parsing_rules:
+  list_selector: "//div[@class='video']"
+  title: ".title"
+  url: ".link/@href"
+  thumbnail: ".thumb/@src"
