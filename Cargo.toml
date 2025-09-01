@@ -14,7 +14,7 @@ wasmtime-wasi = { version = "28.0.0" }
 wasmtime-wasi-http = { version = "28.0.0" }
 wit-bindgen = "0.45"
 wit-component = "0.238"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync"] }
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 plugin-interface = { path = "plugin-interface", features = ["host"] }
@@ -25,6 +25,9 @@ url = "2"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 toml = "0.8"
+# Downloads
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 wit-bindgen = "0.45"

@@ -1,9 +1,10 @@
 mod cli;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, DownloadCmd, SeriesCmd};
 use clap::Parser;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use touring::prelude::MediaType;
+use std::io::Write; // for zip.write_all
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create runtime for async library API and plugin loading
@@ -158,7 +159,98 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rt.block_on(touring.vacuum_db())?;
             println!("Database vacuum completed.");
         }
+        Commands::Download { cmd } => match cmd {
+            DownloadCmd::Chapter { chapter_id, out, cbz, force } => {
+                let urls = rt.block_on(touring.get_chapter_images(&chapter_id))?;
+                if urls.is_empty() { println!("No images found."); return Ok(()); }
+                if cbz {
+                    rt.block_on(save_cbz(&chapter_id, &urls, &PathBuf::from(out), force))?;
+                } else {
+                    rt.block_on(save_images(&chapter_id, &urls, &PathBuf::from(out), force))?;
+                }
+                println!("Saved {} images.", urls.len());
+            }
+            DownloadCmd::Episode { episode_id, out, index } => {
+                let streams = rt.block_on(touring.get_episode_streams(&episode_id))?;
+                if streams.is_empty() { println!("No streams found."); return Ok(()); }
+                let idx = index.min(streams.len() - 1);
+                let s = &streams[idx];
+                println!("Selected stream: {}{}", s.url, s.mime.as_deref().map(|m| format!(" ({})", m)).unwrap_or_default());
+                let out_path = out.clone();
+                // For now just write the URL to the file to indicate selection; real muxing left for later
+                rt.block_on(async move {
+                    tokio::fs::write(out_path, s.url.as_bytes()).await
+                })?;
+                println!("Wrote stream URL to {}", out);
+            }
+        },
+        Commands::Series { cmd } => match cmd {
+            SeriesCmd::List { kind } => {
+                let rows = rt.block_on(touring.list_series(kind.as_deref()))?;
+                for (id, title) in rows { println!("{}\t{}", id, title); }
+            }
+            SeriesCmd::SetPath { series_id, path } => {
+                rt.block_on(touring.set_series_download_path(&series_id, path.as_deref()))?;
+                let current = rt.block_on(touring.get_series_download_path(&series_id))?;
+                println!("Series {} download_path = {:?}", series_id, current);
+            }
+            SeriesCmd::Delete { series_id } => {
+                let n = rt.block_on(touring.delete_series(&series_id))?;
+                println!("Deleted series {} (rows affected: {})", series_id, n);
+            }
+            SeriesCmd::DeleteChapter { chapter_id } => {
+                let n = rt.block_on(touring.delete_chapter(&chapter_id))?;
+                println!("Deleted chapter {} (rows affected: {})", chapter_id, n);
+            }
+            SeriesCmd::DeleteEpisode { episode_id } => {
+                let n = rt.block_on(touring.delete_episode(&episode_id))?;
+                println!("Deleted episode {} (rows affected: {})", episode_id, n);
+            }
+        },
     }
 
+    Ok(())
+}
+
+async fn save_images(chapter_id: &str, urls: &[String], out_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::fs::create_dir_all(out_dir).await.ok();
+    let client = reqwest::Client::builder().user_agent("touring/0.1").build()?;
+    for (i, url) in urls.iter().enumerate() {
+        let fname = format!("{:04}.jpg", i + 1);
+        let path = out_dir.join(fname);
+        if !force {
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) { continue; }
+        }
+        let resp = client.get(url).send().await?;
+        if !resp.status().is_success() { eprintln!("Failed to download {}: {}", url, resp.status()); continue; }
+        let bytes = resp.bytes().await?;
+        tokio::fs::write(&path, &bytes).await?;
+    }
+    Ok(())
+}
+
+async fn save_cbz(_chapter_id: &str, urls: &[String], out_file: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if !force && tokio::fs::try_exists(out_file).await.unwrap_or(false) { return Ok(()); }
+    let tmp_dir = out_file.with_extension("tmpdir");
+    tokio::fs::create_dir_all(&tmp_dir).await.ok();
+    save_images(_chapter_id, urls, &tmp_dir, true).await?;
+    // Zip the directory into a CBZ
+    let file = std::fs::File::create(out_file)?;
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut entries: Vec<_> = std::fs::read_dir(&tmp_dir)?.filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_file() {
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            zip.start_file(name, options)?;
+            let data = std::fs::read(&path)?;
+            zip.write_all(&data)?;
+        }
+    }
+    zip.finish()?;
+    // Cleanup tmp dir
+    let _ = std::fs::remove_dir_all(&tmp_dir);
     Ok(())
 }

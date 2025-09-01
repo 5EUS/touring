@@ -73,6 +73,12 @@ pub struct StreamInsert {
     pub mime: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeriesPref {
+    pub series_id: String,
+    pub download_path: Option<String>,
+}
+
 pub async fn upsert_source(pool: &AnyPool, src: &SourceInsert) -> Result<()> {
     sqlx::query(
         "INSERT INTO sources(id, version) VALUES(?, ?)\n         ON CONFLICT(id) DO UPDATE SET version=excluded.version, updated_at=CURRENT_TIMESTAMP",
@@ -233,4 +239,75 @@ pub async fn find_episode_id_by_source_external(pool: &AnyPool, source_id: &str,
     .fetch_optional(pool)
     .await?;
     Ok(id)
+}
+
+// New: preferences
+pub async fn get_series_pref(pool: &AnyPool, series_id: &str) -> Result<Option<SeriesPref>> {
+    let row = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT series_id, download_path FROM series_prefs WHERE series_id = ?",
+    )
+    .bind(series_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(series_id, download_path)| SeriesPref { series_id, download_path }))
+}
+
+pub async fn set_series_download_path(pool: &AnyPool, series_id: &str, path: Option<&str>) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO series_prefs(series_id, download_path) VALUES(?, ?)\n         ON CONFLICT(series_id) DO UPDATE SET download_path=excluded.download_path, updated_at=CURRENT_TIMESTAMP",
+    )
+    .bind(series_id)
+    .bind(path)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// Deletion helpers (cascade removes children where FK declared)
+pub async fn delete_series(pool: &AnyPool, series_id: &str) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM series WHERE id = ?").bind(series_id).execute(pool).await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn delete_chapter(pool: &AnyPool, chapter_id: &str) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM chapters WHERE id = ?").bind(chapter_id).execute(pool).await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn delete_episode(pool: &AnyPool, episode_id: &str) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM episodes WHERE id = ?").bind(episode_id).execute(pool).await?;
+    Ok(res.rows_affected())
+}
+
+// Lookups to drive downloads/selection
+pub async fn list_series(pool: &AnyPool, kind: Option<&str>) -> Result<Vec<(String, String)>> {
+    let rows = if let Some(k) = kind {
+        sqlx::query_as::<_, (String, String)>("SELECT id, title FROM series WHERE kind = ? ORDER BY title")
+            .bind(k)
+            .fetch_all(pool)
+            .await?
+    } else {
+        sqlx::query_as::<_, (String, String)>("SELECT id, title FROM series ORDER BY title").fetch_all(pool).await?
+    };
+    Ok(rows)
+}
+
+pub async fn list_chapters_for_series(pool: &AnyPool, series_id: &str) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
+    let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>)>(
+        "SELECT id, number_num, number_text FROM chapters WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
+    )
+    .bind(series_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn list_episodes_for_series(pool: &AnyPool, series_id: &str) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
+    let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>)>(
+        "SELECT id, number_num, number_text FROM episodes WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
+    )
+    .bind(series_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }

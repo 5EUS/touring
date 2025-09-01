@@ -89,4 +89,76 @@ pub enum Commands {
     },
     /// Vacuum/compact the database (SQLite only; no-op for others)
     VacuumDb,
+    /// Download helpers
+    Download {
+        #[command(subcommand)]
+        cmd: DownloadCmd,
+    },
+    /// Manage series stored in the database
+    Series {
+        #[command(subcommand)]
+        cmd: SeriesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DownloadCmd {
+    /// Download all images for a chapter to a directory (or a cbz file)
+    Chapter {
+        /// Chapter ID
+        chapter_id: String,
+        /// Output directory (created if missing). If --cbz is used, this is the .cbz path.
+        #[arg(long)]
+        out: String,
+        /// Create a .cbz instead of files on disk
+        #[arg(long)]
+        cbz: bool,
+        /// Overwrite existing files
+        #[arg(long)]
+        force: bool,
+    },
+    /// Download a video stream (HLS/DASH not yet muxed) to a file
+    Episode {
+        /// Episode ID
+        episode_id: String,
+        /// Output file
+        #[arg(long)]
+        out: String,
+        /// Select stream by index (default 0)
+        #[arg(long, default_value_t = 0)]
+        index: usize,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SeriesCmd {
+    /// List series (optionally by kind)
+    List {
+        /// Filter series by kind (e.g., manga, anime)
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Set or clear the download path for a series
+    SetPath {
+        /// Series ID to set the download path for
+        series_id: String,
+        /// New download path (leave empty to clear)
+        #[arg(long)]
+        path: Option<String>,
+    },
+    /// Delete a series (cascades to chapters/episodes/streams/images)
+    Delete {
+        /// Series ID to delete
+        series_id: String,
+    },
+    /// Delete a single chapter by id
+    DeleteChapter {
+        /// Chapter ID to delete
+        chapter_id: String,
+    },
+    /// Delete a single episode by id
+    DeleteEpisode {
+        /// Episode ID to delete
+        episode_id: String,
+    },
 }

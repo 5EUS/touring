@@ -2,11 +2,10 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::db::Database;
-use crate::plugins::{PluginManager, Media, Unit, UnitKind, MediaType, Asset, AssetKind, ProviderCapabilities};
+use crate::plugins::{PluginManager, Media, Unit, UnitKind, MediaType, Asset, ProviderCapabilities};
 use crate::storage::Storage;
 use crate::dao;
 use crate::mapping::{series_insert_from_media, series_source_from, chapter_insert_from_unit};
-use serde::{Serialize, Deserialize};
 use crate::types::{MediaCache, SearchEntry, media_to_cache, media_from_cache};
 
 /// Aggregator decouples media aggregation and persistence from the CLI/backend.
@@ -110,7 +109,7 @@ impl Aggregator {
                 }
             }
 
-            let list = if let Some(mut medias) = hit {
+            let list = if let Some(medias) = hit {
                 // Upsert for each media from cache
                 for m in &medias {
                     let _ = self.upsert_source(&source, "unknown");
@@ -160,7 +159,7 @@ impl Aggregator {
                 }
             }
 
-            let list = if let Some(mut medias) = hit {
+            let list = if let Some(medias) = hit {
                 for m in &medias {
                     let _ = self.upsert_source(&source, "unknown");
                     let _ = self.get_or_create_series_id(&source, &m.id, m);

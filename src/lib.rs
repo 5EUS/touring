@@ -96,7 +96,7 @@ impl Touring {
                 let pm = self.pm.clone();
                 let src = source.clone();
                 let q = query.to_string();
-                let mut results = tokio::task::spawn_blocking(move || pm.lock().unwrap().search_manga_for(&src, &q)).await.unwrap()?;
+                let results = tokio::task::spawn_blocking(move || pm.lock().unwrap().search_manga_for(&src, &q)).await.unwrap()?;
                 for m in &results {
                     let _ = self.upsert_source(&source, "unknown").await;
                     let _ = self.get_or_create_series_id(&source, &m.id, m).await;
@@ -286,6 +286,48 @@ impl Touring {
 
     /// Vacuum/compact the database (SQLite only; no-op on others).
     pub async fn vacuum_db(&self) -> Result<()> { self.db.vacuum().await.map_err(Into::into) }
+
+    // --- Series management APIs ---
+
+    pub async fn list_series(&self, kind: Option<&str>) -> Result<Vec<(String, String)>> {
+        let pool = self.db.pool().clone();
+        crate::dao::list_series(&pool, kind).await
+    }
+
+    pub async fn list_chapters_for_series(&self, series_id: &str) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
+        let pool = self.db.pool().clone();
+        crate::dao::list_chapters_for_series(&pool, series_id).await
+    }
+
+    pub async fn list_episodes_for_series(&self, series_id: &str) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
+        let pool = self.db.pool().clone();
+        crate::dao::list_episodes_for_series(&pool, series_id).await
+    }
+
+    pub async fn get_series_download_path(&self, series_id: &str) -> Result<Option<String>> {
+        let pool = self.db.pool().clone();
+        Ok(crate::dao::get_series_pref(&pool, series_id).await?.and_then(|p| p.download_path))
+    }
+
+    pub async fn set_series_download_path(&self, series_id: &str, path: Option<&str>) -> Result<()> {
+        let pool = self.db.pool().clone();
+        crate::dao::set_series_download_path(&pool, series_id, path).await
+    }
+
+    pub async fn delete_series(&self, series_id: &str) -> Result<u64> {
+        let pool = self.db.pool().clone();
+        crate::dao::delete_series(&pool, series_id).await
+    }
+
+    pub async fn delete_chapter(&self, chapter_id: &str) -> Result<u64> {
+        let pool = self.db.pool().clone();
+        crate::dao::delete_chapter(&pool, chapter_id).await
+    }
+
+    pub async fn delete_episode(&self, episode_id: &str) -> Result<u64> {
+        let pool = self.db.pool().clone();
+        crate::dao::delete_episode(&pool, episode_id).await
+    }
 
     // --- helpers ---
 
