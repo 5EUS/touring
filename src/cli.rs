@@ -22,4 +22,14 @@ pub enum Commands {
         /// Query to search for
         query: String,
     },
+    /// Get chapters for a specific manga
+    Chapters {
+        /// Manga ID to get chapters for
+        manga_id: String,
+    },
+    /// Get chapter images
+    Chapter {
+        /// Chapter ID to retrieve images for
+        chapter_id: String,
+    },
 }

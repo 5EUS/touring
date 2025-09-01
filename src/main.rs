@@ -51,6 +51,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("Error fetching manga list: {}", e),
             }
         }
+        Commands::Chapters { manga_id } => {
+            println!("Fetching chapters for manga ID: {}", manga_id);
+            if pm.list_plugins().is_empty() {
+                eprintln!("No plugins loaded");
+                return Ok(());
+            }
+            match pm.get_manga_chapters(&manga_id) {
+                Ok(chapters) => {
+                    if chapters.is_empty() {
+                        println!("No chapters found for manga ID: {}", manga_id);
+                    } else {
+                        println!("Found {} chapters for manga {}:", chapters.len(), manga_id);
+                        for chapter in chapters {
+                            println!("  {}: {}", chapter.id, chapter.title);
+                            if let Some(description) = &chapter.description {
+                                println!("    {}", description);
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error fetching chapters: {}", e),
+            }
+        }
+        Commands::Chapter { chapter_id } => {
+            println!("Fetching chapter images for chapter ID: {}", chapter_id);
+            if pm.list_plugins().is_empty() {
+                eprintln!("No plugins loaded");
+                return Ok(());
+            }
+            match pm.get_chapter_images(&chapter_id) {
+                Ok(image_urls) => {
+                    if image_urls.is_empty() {
+                        println!("No images found for chapter ID: {}", chapter_id);
+                    } else {
+                        println!("Found {} images for chapter {}:", image_urls.len(), chapter_id);
+                        for (index, url) in image_urls.iter().enumerate() {
+                            println!("  {}: {}", index + 1, url);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error fetching chapter images: {}", e),
+            }
+        }
     }
     Ok(())
 }

@@ -200,6 +200,140 @@ pub unsafe fn __post_return_fetchmangalist<T: Guest>(arg0: *mut u8,) { unsafe {
 } }
 #[doc(hidden)]
 #[allow(non_snake_case, unused_unsafe)]
+pub unsafe fn _export_fetchmangachapterlist_cabi<T: Guest>(arg0: *mut u8,arg1: usize,) -> *mut u8 { unsafe {#[cfg(target_arch="wasm32")]
+_rt::run_ctors_once();let result1 = {
+  let len0 = arg1;
+  let bytes0 = _rt::Vec::from_raw_parts(arg0.cast(), len0, len0);
+  T::fetchmangachapterlist(_rt::string_lift(bytes0))
+};
+let ptr2 = (&raw mut _RET_AREA.0).cast::<u8>();
+let vec9 = result1;
+let len9 = vec9.len();
+let layout9 = _rt::alloc::Layout::from_size_align(vec9.len() * (13*::core::mem::size_of::<*const u8>()), ::core::mem::size_of::<*const u8>()).unwrap();
+let (result9, _cleanup9) = wit_bindgen::rt::Cleanup::new(layout9);if let Some(cleanup) = _cleanup9 { cleanup.forget(); }
+for (i, e) in vec9.into_iter().enumerate() {
+  let base = result9.add(i * (13*::core::mem::size_of::<*const u8>()));
+  {
+    let Media{ id:id3, mediatype:mediatype3, title:title3, description:description3, url:url3, } = e;
+    let vec4 = (id3.into_bytes()).into_boxed_slice();
+    let ptr4 = vec4.as_ptr().cast::<u8>();
+    let len4 = vec4.len();
+    ::core::mem::forget(vec4);
+    *base.add(::core::mem::size_of::<*const u8>()).cast::<usize>() = len4;
+    *base.add(0).cast::<*mut u8>() = ptr4.cast_mut();
+    match mediatype3 {
+      MediaType::Anime=> {
+        {
+          *base.add(2*::core::mem::size_of::<*const u8>()).cast::<u8>() = (0i32) as u8;
+        }
+      }
+      MediaType::Manga=> {
+        {
+          *base.add(2*::core::mem::size_of::<*const u8>()).cast::<u8>() = (1i32) as u8;
+        }
+      }
+      MediaType::Other(e) => {
+        *base.add(2*::core::mem::size_of::<*const u8>()).cast::<u8>() = (2i32) as u8;
+        let vec5 = (e.into_bytes()).into_boxed_slice();
+        let ptr5 = vec5.as_ptr().cast::<u8>();
+        let len5 = vec5.len();
+        ::core::mem::forget(vec5);
+        *base.add(4*::core::mem::size_of::<*const u8>()).cast::<usize>() = len5;
+        *base.add(3*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr5.cast_mut();
+      },
+    }
+    let vec6 = (title3.into_bytes()).into_boxed_slice();
+    let ptr6 = vec6.as_ptr().cast::<u8>();
+    let len6 = vec6.len();
+    ::core::mem::forget(vec6);
+    *base.add(6*::core::mem::size_of::<*const u8>()).cast::<usize>() = len6;
+    *base.add(5*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr6.cast_mut();
+    match description3 {
+      Some(e) => {
+        *base.add(7*::core::mem::size_of::<*const u8>()).cast::<u8>() = (1i32) as u8;
+        let vec7 = (e.into_bytes()).into_boxed_slice();
+        let ptr7 = vec7.as_ptr().cast::<u8>();
+        let len7 = vec7.len();
+        ::core::mem::forget(vec7);
+        *base.add(9*::core::mem::size_of::<*const u8>()).cast::<usize>() = len7;
+        *base.add(8*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr7.cast_mut();
+      },
+      None => {
+        {
+          *base.add(7*::core::mem::size_of::<*const u8>()).cast::<u8>() = (0i32) as u8;
+        }
+      },
+    };match url3 {
+      Some(e) => {
+        *base.add(10*::core::mem::size_of::<*const u8>()).cast::<u8>() = (1i32) as u8;
+        let vec8 = (e.into_bytes()).into_boxed_slice();
+        let ptr8 = vec8.as_ptr().cast::<u8>();
+        let len8 = vec8.len();
+        ::core::mem::forget(vec8);
+        *base.add(12*::core::mem::size_of::<*const u8>()).cast::<usize>() = len8;
+        *base.add(11*::core::mem::size_of::<*const u8>()).cast::<*mut u8>() = ptr8.cast_mut();
+      },
+      None => {
+        {
+          *base.add(10*::core::mem::size_of::<*const u8>()).cast::<u8>() = (0i32) as u8;
+        }
+      },
+    };}
+  }
+  *ptr2.add(::core::mem::size_of::<*const u8>()).cast::<usize>() = len9;
+  *ptr2.add(0).cast::<*mut u8>() = result9;
+  ptr2
+} }
+#[doc(hidden)]
+#[allow(non_snake_case)]
+pub unsafe fn __post_return_fetchmangachapterlist<T: Guest>(arg0: *mut u8,) { unsafe {
+  let l0 = *arg0.add(0).cast::<*mut u8>();
+  let l1 = *arg0.add(::core::mem::size_of::<*const u8>()).cast::<usize>();
+  let base15 = l0;
+  let len15 = l1;
+  for i in 0..len15 {
+    let base = base15.add(i * (13*::core::mem::size_of::<*const u8>()));
+    {
+      let l2 = *base.add(0).cast::<*mut u8>();
+      let l3 = *base.add(::core::mem::size_of::<*const u8>()).cast::<usize>();
+      _rt::cabi_dealloc(l2, l3, 1);
+      let l4 = i32::from(*base.add(2*::core::mem::size_of::<*const u8>()).cast::<u8>());
+      match l4 {
+        0 => (),
+        1 => (),
+        _ => {
+          let l5 = *base.add(3*::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+          let l6 = *base.add(4*::core::mem::size_of::<*const u8>()).cast::<usize>();
+          _rt::cabi_dealloc(l5, l6, 1);
+        },
+      }
+      let l7 = *base.add(5*::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+      let l8 = *base.add(6*::core::mem::size_of::<*const u8>()).cast::<usize>();
+      _rt::cabi_dealloc(l7, l8, 1);
+      let l9 = i32::from(*base.add(7*::core::mem::size_of::<*const u8>()).cast::<u8>());
+      match l9 {
+        0 => (),
+        _ => {
+          let l10 = *base.add(8*::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+          let l11 = *base.add(9*::core::mem::size_of::<*const u8>()).cast::<usize>();
+          _rt::cabi_dealloc(l10, l11, 1);
+        },
+      }
+      let l12 = i32::from(*base.add(10*::core::mem::size_of::<*const u8>()).cast::<u8>());
+      match l12 {
+        0 => (),
+        _ => {
+          let l13 = *base.add(11*::core::mem::size_of::<*const u8>()).cast::<*mut u8>();
+          let l14 = *base.add(12*::core::mem::size_of::<*const u8>()).cast::<usize>();
+          _rt::cabi_dealloc(l13, l14, 1);
+        },
+      }
+    }
+  }
+  _rt::cabi_dealloc(base15, len15 * (13*::core::mem::size_of::<*const u8>()), ::core::mem::size_of::<*const u8>());
+} }
+#[doc(hidden)]
+#[allow(non_snake_case, unused_unsafe)]
 pub unsafe fn _export_fetchchapterimages_cabi<T: Guest>(arg0: *mut u8,arg1: usize,) -> *mut u8 { unsafe {#[cfg(target_arch="wasm32")]
 _rt::run_ctors_once();let result1 = {
   let len0 = arg1;
@@ -564,6 +698,9 @@ pub trait Guest {
   /// Fetch a list of manga by query
   #[allow(async_fn_in_trait)]
   fn fetchmangalist(query: _rt::String,) -> _rt::Vec::<Media>;
+  /// Fetch a list of chapters by query
+  #[allow(async_fn_in_trait)]
+  fn fetchmangachapterlist(query: _rt::String,) -> _rt::Vec::<Media>;
   /// Fetch all image URLs for a given chapter
   #[allow(async_fn_in_trait)]
   fn fetchchapterimages(chapterid: _rt::String,) -> _rt::Vec::<_rt::String>;
@@ -589,6 +726,14 @@ macro_rules! __export_world_source_cabi{
     #[unsafe(export_name = "cabi_post_fetchmangalist")]
     unsafe extern "C" fn _post_return_fetchmangalist(arg0: *mut u8,) {
       unsafe { $($path_to_types)*::__post_return_fetchmangalist::<$ty>(arg0) }
+    }
+    #[unsafe(export_name = "fetchmangachapterlist")]
+    unsafe extern "C" fn export_fetchmangachapterlist(arg0: *mut u8,arg1: usize,) -> *mut u8 {
+      unsafe { $($path_to_types)*::_export_fetchmangachapterlist_cabi::<$ty>(arg0, arg1) }
+    }
+    #[unsafe(export_name = "cabi_post_fetchmangachapterlist")]
+    unsafe extern "C" fn _post_return_fetchmangachapterlist(arg0: *mut u8,) {
+      unsafe { $($path_to_types)*::__post_return_fetchmangachapterlist::<$ty>(arg0) }
     }
     #[unsafe(export_name = "fetchchapterimages")]
     unsafe extern "C" fn export_fetchchapterimages(arg0: *mut u8,arg1: usize,) -> *mut u8 {
@@ -713,19 +858,19 @@ pub(crate) use __export_source_impl as export;
 #[unsafe(link_section = "component-type:wit-bindgen:0.45.0:touring:source:source:encoded world")]
 #[doc(hidden)]
 #[allow(clippy::octal_escapes)]
-pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 519] = *b"\
-\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\x8a\x03\x01A\x02\x01\
-A\x17\x01q\x03\x05anime\0\0\x05manga\0\0\x05other\x01s\0\x03\0\x0amedia-type\x03\
+pub static __WIT_BINDGEN_COMPONENT_TYPE: [u8; 545] = *b"\
+\0asm\x0d\0\x01\0\0\x19\x16wit-component-encoding\x04\0\x07\xa4\x03\x01A\x02\x01\
+A\x18\x01q\x03\x05anime\0\0\x05manga\0\0\x05other\x01s\0\x03\0\x0amedia-type\x03\
 \0\0\x01ks\x01r\x05\x02ids\x09mediatype\x01\x05titles\x0bdescription\x02\x03url\x02\
 \x03\0\x05media\x03\0\x03\x01kv\x01r\x04\x02ids\x05titles\x06number\x05\x03url\x02\
 \x03\0\x07episode\x03\0\x06\x01r\x03\x03urls\x07quality\x02\x04mime\x02\x03\0\x0b\
 mediastream\x03\0\x08\x01p\x04\x01@\x01\x05querys\0\x0a\x04\0\x0efetchmangalist\x01\
-\x0b\x01ps\x01@\x01\x09chapterids\0\x0c\x04\0\x12fetchchapterimages\x01\x0d\x04\0\
-\x0efetchanimelist\x01\x0b\x01p\x07\x01@\x01\x07animeids\0\x0e\x04\0\x12fetchani\
-meepisodes\x01\x0f\x01p\x09\x01@\x01\x09episodeids\0\x10\x04\0\x13fetchepisodest\
-reams\x01\x11\x04\0\x15touring:source/source\x04\0\x0b\x0c\x01\0\x06source\x03\0\
-\0\0G\x09producers\x01\x0cprocessed-by\x02\x0dwit-component\x070.238.0\x10wit-bi\
-ndgen-rust\x060.45.0";
+\x0b\x04\0\x15fetchmangachapterlist\x01\x0b\x01ps\x01@\x01\x09chapterids\0\x0c\x04\
+\0\x12fetchchapterimages\x01\x0d\x04\0\x0efetchanimelist\x01\x0b\x01p\x07\x01@\x01\
+\x07animeids\0\x0e\x04\0\x12fetchanimeepisodes\x01\x0f\x01p\x09\x01@\x01\x09epis\
+odeids\0\x10\x04\0\x13fetchepisodestreams\x01\x11\x04\0\x15touring:source/source\
+\x04\0\x0b\x0c\x01\0\x06source\x03\0\0\0G\x09producers\x01\x0cprocessed-by\x02\x0d\
+wit-component\x070.238.0\x10wit-bindgen-rust\x060.45.0";
 
 #[inline(never)]
 #[doc(hidden)]

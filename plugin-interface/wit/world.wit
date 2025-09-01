@@ -4,6 +4,9 @@ world source {
   /// Fetch a list of manga by query
   export fetchmangalist: func(query: string) -> list<media>;
 
+  /// Fetch a list of chapters by query
+  export fetchmangachapterlist: func(query: string) -> list<media>;
+
   /// Fetch all image URLs for a given chapter
   export fetchchapterimages: func(chapterid: string) -> list<string>;
 

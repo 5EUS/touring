@@ -14,7 +14,7 @@ wasmtime::component::bindgen!({
 struct Host {
     wasi: WasiCtx,
     table: wasmtime_wasi::ResourceTable,
-    http: WasiHttpCtx,
+    http: WasiHttpCtx, // TODO limit allowed hosts by plugin config
 }
 
 impl WasiView for Host {
@@ -87,6 +87,11 @@ impl Plugin {
     fn fetch_manga_list(&mut self, query: &str) -> Result<Vec<Media>> {
         self.bindings.call_fetchmangalist(&mut self.store, query)
             .map_err(|e| anyhow!("Failed to call fetchmangalist: {}", e))
+    }
+
+    fn fetch_manga_chapter_list(&mut self, manga_id: &str) -> Result<Vec<Media>> {
+        self.bindings.call_fetchmangachapterlist(&mut self.store, manga_id)
+            .map_err(|e| anyhow!("Failed to call fetchmangachapterlist: {}", e))
     }
 
     fn fetch_chapter_images(&mut self, chapter_id: &str) -> Result<Vec<String>> {
@@ -168,6 +173,17 @@ impl PluginManager {
             }
         }
         Ok(all)
+    }
+
+    pub fn get_manga_chapters(&mut self, manga_id: &str) -> Result<Vec<Media>> {
+        for plugin in &mut self.plugins {
+            match plugin.fetch_manga_chapter_list(manga_id) {
+                Ok(chapters) if !chapters.is_empty() => return Ok(chapters),
+                Ok(_) => continue,
+                Err(e) => eprintln!("Plugin failed fetchmangachapterlist: {}", e),
+            }
+        }
+        Ok(Vec::new())
     }
 
     pub fn get_chapter_images(&mut self, chapter_id: &str) -> Result<Vec<String>> {
