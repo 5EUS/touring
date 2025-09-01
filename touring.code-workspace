@@ -8,6 +8,9 @@
 		},
 		{
 			"path": "../nefarious_plugin"
+		},
+		{
+			"path": "../test_plugin"
 		}
 	],
 	"settings": {}

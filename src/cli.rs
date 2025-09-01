@@ -81,4 +81,12 @@ pub enum Commands {
         /// Episode ID to retrieve streams for
         episode_id: String,
     },
+    /// Refresh cache for a given key prefix (e.g., search) by forcing refresh on next access
+    RefreshCache {
+        /// Optional key prefix to clear (defaults to all)
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+    /// Vacuum/compact the database (SQLite only; no-op for others)
+    VacuumDb,
 }

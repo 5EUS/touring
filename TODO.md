@@ -4,13 +4,7 @@ Data model and persistence
 - Normalize languages and seasons/volumes (consistent codes/format).
 - Add created_by_source on mapping tables to aid debugging.
 
-Caching and performance
-- Search cache: cache search results per source+kind+query with TTL; invalidate on explicit refresh.
-- Chapter image cache: add ETag/If-Modified-Since support when providers expose it; configurable TTLs.
-
 CLI and UX
-- Show source in outputs (e.g., “Anime [mangadex]: Title”).
-- Add --plugins-dir and --json output for machine readability.
 - Add commands: capabilities, refresh-cache, vacuum-db.
 
 Testing and tooling

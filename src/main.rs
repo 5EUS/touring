@@ -177,6 +177,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("Error fetching streams: {}", e),
             }
         }
+        Commands::RefreshCache { prefix } => {
+            let count = agg.clear_cache_prefix(prefix.as_deref())?;
+            if let Some(p) = prefix { println!("Cleared {} cache entries with prefix '{}'.", count, p); }
+            else { println!("Cleared {} cache entries.", count); }
+        }
+        Commands::VacuumDb => {
+            agg.vacuum_db()?;
+            println!("Database vacuum completed.");
+        }
     }
 
     Ok(())

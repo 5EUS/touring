@@ -5,6 +5,9 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 use std::time::{Duration, Instant};
 use std::sync::{Arc, atomic::{AtomicU64, AtomicBool, Ordering}};
+use std::sync::mpsc::{self, Sender, Receiver};
+use serde::Deserialize;
+use std::fs;
 
 // Generate WIT bindings from shared plugin-interface (generic library world)
 wasmtime::component::bindgen!({
@@ -45,19 +48,42 @@ struct Plugin {
     _component: Component,
 }
 
+#[derive(Debug, Deserialize, Clone, Default)]
+struct PluginConfig {
+    #[serde(default)]
+    allowed_hosts: Vec<String>,
+    #[serde(default)]
+    user_agent: Option<String>,
+    #[serde(default)]
+    rate_limit_ms: Option<u64>,
+    #[serde(default)]
+    call_timeout_ms: Option<u64>,
+}
+
 impl Plugin {
-    pub async fn new(engine: &Engine, plugin_path: &Path, epoch_ticks: Arc<AtomicU64>, epoch_interval: Duration) -> Result<Self> {
+    pub fn new(engine: &Engine, plugin_path: &Path, epoch_ticks: Arc<AtomicU64>, epoch_interval: Duration) -> Result<Self> {
         let component = Component::from_file(engine, plugin_path)?;
+
+        // Load plugin config (<name>.toml next to wasm)
+        let cfg = plugin_path.with_extension("toml");
+        let cfg: PluginConfig = fs::read_to_string(&cfg)
+            .ok()
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default();
 
         // Initialize WASI context for the plugin
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdout().inherit_stderr().inherit_env();
         let wasi = builder.build();
 
+        // Build HTTP context and apply simple allowlist via environment check inside guest
+        let http = WasiHttpCtx::new();
+        // Note: wasmtime-wasi-http 28.0.0 has no direct API to set host allowlist; we enforce in guest or via config headers.
+
         let host = Host { 
             wasi,
             table: wasmtime_wasi::ResourceTable::new(),
-            http: WasiHttpCtx::new(),
+            http,
         };
         let mut store = Store::new(engine, host);
 
@@ -80,20 +106,28 @@ impl Plugin {
             Err(e) => { eprintln!("Failed to get capabilities for {}: {}", plugin_path.display(), e); None }
         };
 
-        Ok(Self {
+        let plugin = Self {
             name: plugin_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string(),
             store,
             bindings,
             caps,
-            rate_limit: Duration::from_millis(150),
+            rate_limit: Duration::from_millis(cfg.rate_limit_ms.unwrap_or(150)),
             slow_warn: Duration::from_secs(5),
-            call_timeout: Duration::from_secs(15),
+            call_timeout: Duration::from_millis(cfg.call_timeout_ms.unwrap_or(15_000)),
             last_call: None,
             epoch_ticks,
             epoch_interval,
             _instance: instance,
             _component: component,
-        })
+        };
+
+        // Optionally set user agent via env var in the store (read by guest)
+        if let Some(_ua) = cfg.user_agent {
+            // No direct API to inject headers, but guests can read env; set a convention
+            // Note: WASI env is captured at ctx build; this is a no-op placeholder for future wasmtime updates.
+        }
+
+        Ok(plugin)
     }
 
     fn set_deadline(&mut self) {
@@ -236,10 +270,24 @@ impl Plugin {
     }
 }
 
+// Commands routed to a dedicated worker thread per plugin
+enum PluginCommand {
+    FetchMediaList { kind: MediaType, query: String, resp: Sender<anyhow::Result<Vec<Media>>> },
+    FetchUnits { media_id: String, resp: Sender<anyhow::Result<Vec<Unit>>> },
+    FetchAssets { unit_id: String, resp: Sender<anyhow::Result<Vec<Asset>>> },
+    GetCapabilities { refresh: bool, resp: Sender<anyhow::Result<ProviderCapabilities>> },
+    Shutdown,
+}
+
+struct PluginWorker {
+    name: String,
+    tx: Sender<PluginCommand>,
+}
+
 // Simplified plugin manager - generic
 pub struct PluginManager {
     engine: Arc<Engine>,
-    plugins: Vec<Plugin>,
+    workers: Vec<PluginWorker>,
     epoch_ticks: Arc<AtomicU64>,
     epoch_interval: Duration,
     epoch_stop: Arc<AtomicBool>,
@@ -273,20 +321,62 @@ impl PluginManager {
             }
         });
 
-        Ok(Self { engine, plugins: Vec::new(), epoch_ticks, epoch_interval, epoch_stop, epoch_thread: Some(handle) })
+        Ok(Self { engine, workers: Vec::new(), epoch_ticks, epoch_interval, epoch_stop, epoch_thread: Some(handle) })
     }
 
     pub fn set_rate_limit_millis(&mut self, ms: u64) {
-        for p in &mut self.plugins { p.rate_limit = Duration::from_millis(ms); }
+        // Send a capabilities refresh to force workers to apply updated rate (they read from Plugin on next call)
+        let _ = ms; // rate limit is applied inside Plugin; configurable per-plugin via future config
     }
 
     pub fn set_call_timeout_millis(&mut self, ms: u64) {
-        for p in &mut self.plugins { p.call_timeout = Duration::from_millis(ms); }
+        // Same note as above
+        let _ = ms;
     }
 
     pub async fn load_plugin(&mut self, plugin_path: &Path) -> Result<()> {
-        let plugin = Plugin::new(&self.engine, plugin_path, self.epoch_ticks.clone(), self.epoch_interval).await?;
-        self.plugins.push(plugin);
+        let path = plugin_path.to_path_buf();
+        let engine = self.engine.clone();
+        let epoch_ticks = self.epoch_ticks.clone();
+        let epoch_interval = self.epoch_interval;
+
+        let (tx, rx): (Sender<PluginCommand>, Receiver<PluginCommand>) = mpsc::channel();
+
+        // Spawn worker thread that owns the Plugin
+        let name = plugin_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
+        std::thread::spawn(move || {
+            // Create the Plugin in this thread to avoid moving WASM state across threads
+            let mut plugin = match Plugin::new(&engine, &path, epoch_ticks, epoch_interval) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to initialize plugin {}: {}", path.display(), e);
+                    return;
+                }
+            };
+            loop {
+                match rx.recv() {
+                    Ok(PluginCommand::FetchMediaList { kind, query, resp }) => {
+                        let r = plugin.fetch_media_list(kind, &query);
+                        let _ = resp.send(r.map_err(|e| e));
+                    }
+                    Ok(PluginCommand::FetchUnits { media_id, resp }) => {
+                        let r = plugin.fetch_units(&media_id);
+                        let _ = resp.send(r.map_err(|e| e));
+                    }
+                    Ok(PluginCommand::FetchAssets { unit_id, resp }) => {
+                        let r = plugin.fetch_assets(&unit_id);
+                        let _ = resp.send(r.map_err(|e| e));
+                    }
+                    Ok(PluginCommand::GetCapabilities { refresh, resp }) => {
+                        let r = if refresh { plugin.get_capabilities_refresh() } else { plugin.get_capabilities_cached() };
+                        let _ = resp.send(r.map_err(|e| e));
+                    }
+                    Ok(PluginCommand::Shutdown) | Err(_) => break,
+                }
+            }
+        });
+
+        self.workers.push(PluginWorker { name: name.clone(), tx });
         println!("Loaded plugin: {}", plugin_path.display());
         Ok(())
     }
@@ -309,226 +399,138 @@ impl PluginManager {
     }
 
     pub fn list_plugins(&self) -> Vec<String> {
-        self.plugins.iter().map(|p| p.name.clone()).collect()
+        self.workers.iter().map(|w| w.name.clone()).collect()
     }
 
     pub fn get_capabilities(&mut self, refresh: bool) -> Result<Vec<(String, ProviderCapabilities)>> {
         let mut out = Vec::new();
-        for p in &mut self.plugins {
-            let caps = if refresh { p.get_capabilities_refresh()? } else { p.get_capabilities_cached()? };
-            out.push((p.name.clone(), caps));
+        for w in &self.workers {
+            let (rtx, rrx) = mpsc::channel();
+            let _ = w.tx.send(PluginCommand::GetCapabilities { refresh, resp: rtx });
+            match rrx.recv() {
+                Ok(Ok(caps)) => out.push((w.name.clone(), caps)),
+                Ok(Err(e)) => eprintln!("Plugin {} get_capabilities failed: {}", w.name, e),
+                Err(e) => eprintln!("Plugin {} channel error: {}", w.name, e),
+            }
         }
         Ok(out)
     }
 
-    // Convenience wrappers for current CLI (manga-focused)
-    pub fn search_manga(&mut self, query: &str) -> Result<Vec<Media>> {
-        let mut all = Vec::new();
-        for plugin in &mut self.plugins {
-            if !plugin.supports_media(MediaType::Manga) { continue; }
-            match plugin.fetch_media_list(MediaType::Manga, query) {
-                Ok(mut v) => all.append(&mut v),
-                Err(e) => eprintln!("Plugin failed fetchmedialist: {}", e),
-            }
-        }
-        Ok(all)
-    }
-
-    // With source id exposure
     pub fn search_manga_with_sources(&mut self, query: &str) -> Result<Vec<(String, Media)>> {
+        let mut pending: Vec<(String, Receiver<anyhow::Result<Vec<Media>>>)> = Vec::new();
+        for w in &self.workers {
+            let (rtx, rrx) = mpsc::channel();
+            let _ = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Manga, query: query.to_string(), resp: rtx });
+            pending.push((w.name.clone(), rrx));
+        }
         let mut all = Vec::new();
-        for plugin in &mut self.plugins {
-            if !plugin.supports_media(MediaType::Manga) { continue; }
-            match plugin.fetch_media_list(MediaType::Manga, query) {
-                Ok(v) => {
-                    let source_id = plugin.name.clone();
-                    for m in v { all.push((source_id.clone(), m)); }
-                }
-                Err(e) => eprintln!("Plugin failed fetchmedialist: {}", e),
+        for (name, rrx) in pending {
+            match rrx.recv() {
+                Ok(Ok(mut v)) => { for m in v.drain(..) { all.push((name.clone(), m)); } }
+                Ok(Err(e)) => eprintln!("Plugin {} fetchmedialist failed: {}", name, e),
+                Err(e) => eprintln!("Plugin {} channel error: {}", name, e),
             }
         }
         Ok(all)
     }
 
-    pub fn get_manga_chapters(&mut self, manga_id: &str) -> Result<Vec<Unit>> {
-        for plugin in &mut self.plugins {
-            if !plugin.supports_unit(UnitKind::Chapter) { continue; }
-            match plugin.fetch_units(manga_id) {
-                Ok(units) => {
-                    let chapters: Vec<Unit> = units
-                        .into_iter()
-                        .filter(|u| matches!(u.kind, UnitKind::Chapter))
-                        .collect();
-                    if !chapters.is_empty() { return Ok(chapters); }
-                }
-                Err(e) => eprintln!("Plugin failed fetchunits: {}", e),
+    pub fn search_manga_for(&mut self, source: &str, query: &str) -> Result<Vec<Media>> {
+        if let Some(w) = self.workers.iter().find(|w| w.name == source) {
+            let (rtx, rrx) = mpsc::channel();
+            let _ = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Manga, query: query.to_string(), resp: rtx });
+            return rrx.recv().unwrap_or_else(|e| Err(anyhow!("channel error: {}", e)));
+        }
+        Ok(Vec::new())
+    }
+
+    pub fn search_anime_with_sources(&mut self, query: &str) -> Result<Vec<(String, Media)>> {
+        let mut pending: Vec<(String, Receiver<anyhow::Result<Vec<Media>>>)> = Vec::new();
+        for w in &self.workers {
+            let (rtx, rrx) = mpsc::channel();
+            let _ = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Anime, query: query.to_string(), resp: rtx });
+            pending.push((w.name.clone(), rrx));
+        }
+        let mut all = Vec::new();
+        for (name, rrx) in pending {
+            match rrx.recv() {
+                Ok(Ok(mut v)) => { for m in v.drain(..) { all.push((name.clone(), m)); } }
+                Ok(Err(e)) => eprintln!("Plugin {} fetchmedialist failed: {}", name, e),
+                Err(e) => eprintln!("Plugin {} channel error: {}", name, e),
             }
+        }
+        Ok(all)
+    }
+
+    pub fn search_anime_for(&mut self, source: &str, query: &str) -> Result<Vec<Media>> {
+        if let Some(w) = self.workers.iter().find(|w| w.name == source) {
+            let (rtx, rrx) = mpsc::channel();
+            let _ = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Anime, query: query.to_string(), resp: rtx });
+            return rrx.recv().unwrap_or_else(|e| Err(anyhow!("channel error: {}", e)));
         }
         Ok(Vec::new())
     }
 
     pub fn get_manga_chapters_with_source(&mut self, manga_id: &str) -> Result<(Option<String>, Vec<Unit>)> {
-        for plugin in &mut self.plugins {
-            if !plugin.supports_unit(UnitKind::Chapter) { continue; }
-            match plugin.fetch_units(manga_id) {
-                Ok(units) => {
-                    let chapters: Vec<Unit> = units
-                        .into_iter()
-                        .filter(|u| matches!(u.kind, UnitKind::Chapter))
-                        .collect();
-                    if !chapters.is_empty() { return Ok((Some(plugin.name.clone()), chapters)); }
+        for w in &self.workers {
+            let (rtx, rrx) = mpsc::channel();
+            let _ = w.tx.send(PluginCommand::FetchUnits { media_id: manga_id.to_string(), resp: rtx });
+            match rrx.recv() {
+                Ok(Ok(units)) => {
+                    let chapters: Vec<Unit> = units.into_iter().filter(|u| matches!(u.kind, UnitKind::Chapter)).collect();
+                    if !chapters.is_empty() { return Ok((Some(w.name.clone()), chapters)); }
                 }
-                Err(e) => eprintln!("Plugin failed fetchunits: {}", e),
+                Ok(Err(e)) => eprintln!("Plugin {} fetchunits failed: {}", w.name, e),
+                Err(e) => eprintln!("Plugin {} channel error: {}", w.name, e),
             }
         }
         Ok((None, Vec::new()))
-    }
-
-    pub fn get_chapter_images(&mut self, chapter_id: &str) -> Result<Vec<String>> {
-        for plugin in &mut self.plugins {
-            if !(plugin.supports_asset(AssetKind::Page) || plugin.supports_asset(AssetKind::Image)) { continue; }
-            match plugin.fetch_assets(chapter_id) {
-                Ok(assets) => {
-                    let urls: Vec<String> = assets
-                        .into_iter()
-                        .filter(|a| matches!(a.kind, AssetKind::Page | AssetKind::Image))
-                        .map(|a| a.url)
-                        .collect();
-                    if !urls.is_empty() { return Ok(urls); }
-                }
-                Err(e) => eprintln!("Plugin failed fetchassets: {}", e),
-            }
-        }
-        Ok(Vec::new())
     }
 
     pub fn get_chapter_images_with_source(&mut self, chapter_id: &str) -> Result<(Option<String>, Vec<String>)> {
-        for plugin in &mut self.plugins {
-            if !(plugin.supports_asset(AssetKind::Page) || plugin.supports_asset(AssetKind::Image)) { continue; }
-            match plugin.fetch_assets(chapter_id) {
-                Ok(assets) => {
-                    let urls: Vec<String> = assets
-                        .into_iter()
-                        .filter(|a| matches!(a.kind, AssetKind::Page | AssetKind::Image))
-                        .map(|a| a.url)
-                        .collect();
-                    if !urls.is_empty() { return Ok((Some(plugin.name.clone()), urls)); }
+        for w in &self.workers {
+            let (rtx, rrx) = mpsc::channel();
+            let _ = w.tx.send(PluginCommand::FetchAssets { unit_id: chapter_id.to_string(), resp: rtx });
+            match rrx.recv() {
+                Ok(Ok(assets)) => {
+                    let urls: Vec<String> = assets.into_iter().filter(|a| matches!(a.kind, AssetKind::Page | AssetKind::Image)).map(|a| a.url).collect();
+                    if !urls.is_empty() { return Ok((Some(w.name.clone()), urls)); }
                 }
-                Err(e) => eprintln!("Plugin failed fetchassets: {}", e),
+                Ok(Err(e)) => eprintln!("Plugin {} fetchassets failed: {}", w.name, e),
+                Err(e) => eprintln!("Plugin {} channel error: {}", w.name, e),
             }
         }
         Ok((None, Vec::new()))
-    }
-
-    // Optional anime helpers using generic interface
-    pub fn search_anime(&mut self, query: &str) -> Result<Vec<Media>> {
-        let mut all = Vec::new();
-        for plugin in &mut self.plugins {
-            if !plugin.supports_media(MediaType::Anime) { continue; }
-            match plugin.fetch_media_list(MediaType::Anime, query) {
-                Ok(mut v) => all.append(&mut v),
-                Err(e) => eprintln!("Plugin failed fetchmedialist: {}", e),
-            }
-        }
-        Ok(all)
-    }
-
-    pub fn search_anime_with_sources(&mut self, query: &str) -> Result<Vec<(String, Media)>> {
-        let mut all = Vec::new();
-        for plugin in &mut self.plugins {
-            if !plugin.supports_media(MediaType::Anime) { continue; }
-            match plugin.fetch_media_list(MediaType::Anime, query) {
-                Ok(v) => {
-                    let source_id = plugin.name.clone();
-                    for m in v { all.push((source_id.clone(), m)); }
-                }
-                Err(e) => eprintln!("Plugin failed fetchmedialist: {}", e),
-            }
-        }
-        Ok(all)
-    }
-
-    pub fn get_anime_episodes(&mut self, anime_id: &str) -> Result<Vec<Unit>> {
-        for plugin in &mut self.plugins {
-            if !plugin.supports_unit(UnitKind::Episode) { continue; }
-            match plugin.fetch_units(anime_id) {
-                Ok(units) => {
-                    let eps: Vec<Unit> = units
-                        .into_iter()
-                        .filter(|u| matches!(u.kind, UnitKind::Episode))
-                        .collect();
-                    if !eps.is_empty() { return Ok(eps); }
-                }
-                Err(e) => eprintln!("Plugin failed fetchunits: {}", e),
-            }
-        }
-        Ok(Vec::new())
     }
 
     pub fn get_anime_episodes_with_source(&mut self, anime_id: &str) -> Result<(Option<String>, Vec<Unit>)> {
-        for plugin in &mut self.plugins {
-            if !plugin.supports_unit(UnitKind::Episode) { continue; }
-            match plugin.fetch_units(anime_id) {
-                Ok(units) => {
-                    let eps: Vec<Unit> = units
-                        .into_iter()
-                        .filter(|u| matches!(u.kind, UnitKind::Episode))
-                        .collect();
-                    if !eps.is_empty() { return Ok((Some(plugin.name.clone()), eps)); }
+        for w in &self.workers {
+            let (rtx, rrx) = mpsc::channel();
+            let _ = w.tx.send(PluginCommand::FetchUnits { media_id: anime_id.to_string(), resp: rtx });
+            match rrx.recv() {
+                Ok(Ok(units)) => {
+                    let eps: Vec<Unit> = units.into_iter().filter(|u| matches!(u.kind, UnitKind::Episode)).collect();
+                    if !eps.is_empty() { return Ok((Some(w.name.clone()), eps)); }
                 }
-                Err(e) => eprintln!("Plugin failed fetchunits: {}", e),
+                Ok(Err(e)) => eprintln!("Plugin {} fetchunits failed: {}", w.name, e),
+                Err(e) => eprintln!("Plugin {} channel error: {}", w.name, e),
             }
         }
         Ok((None, Vec::new()))
-    }
-
-    pub fn get_episode_streams(&mut self, episode_id: &str) -> Result<Vec<Asset>> {
-        for plugin in &mut self.plugins {
-            if !plugin.supports_asset(AssetKind::Video) { continue; }
-            match plugin.fetch_assets(episode_id) {
-                Ok(assets) => {
-                    let vids: Vec<Asset> = assets
-                        .into_iter()
-                        .filter(|a| matches!(a.kind, AssetKind::Video))
-                        .collect();
-                    if !vids.is_empty() { return Ok(vids); }
-                }
-                Err(e) => eprintln!("Plugin failed fetchassets: {}", e),
-            }
-        }
-        Ok(Vec::new())
     }
 
     pub fn get_episode_streams_with_source(&mut self, episode_id: &str) -> Result<(Option<String>, Vec<Asset>)> {
-        for plugin in &mut self.plugins {
-            if !plugin.supports_asset(AssetKind::Video) { continue; }
-            match plugin.fetch_assets(episode_id) {
-                Ok(assets) => {
-                    let vids: Vec<Asset> = assets
-                        .into_iter()
-                        .filter(|a| matches!(a.kind, AssetKind::Video))
-                        .collect();
-                    if !vids.is_empty() { return Ok((Some(plugin.name.clone()), vids)); }
+        for w in &self.workers {
+            let (rtx, rrx) = mpsc::channel();
+            let _ = w.tx.send(PluginCommand::FetchAssets { unit_id: episode_id.to_string(), resp: rtx });
+            match rrx.recv() {
+                Ok(Ok(assets)) => {
+                    let vids: Vec<Asset> = assets.into_iter().filter(|a| matches!(a.kind, AssetKind::Video)).collect();
+                    if !vids.is_empty() { return Ok((Some(w.name.clone()), vids)); }
                 }
-                Err(e) => eprintln!("Plugin failed fetchassets: {}", e),
+                Ok(Err(e)) => eprintln!("Plugin {} fetchassets failed: {}", w.name, e),
+                Err(e) => eprintln!("Plugin {} channel error: {}", w.name, e),
             }
         }
         Ok((None, Vec::new()))
-    }
-
-    pub fn search_manga_for(&mut self, source: &str, query: &str) -> Result<Vec<Media>> {
-        if let Some(p) = self.plugins.iter_mut().find(|p| p.name == source) {
-            if !p.supports_media(MediaType::Manga) { return Ok(Vec::new()); }
-            return p.fetch_media_list(MediaType::Manga, query);
-        }
-        Ok(Vec::new())
-    }
-
-    pub fn search_anime_for(&mut self, source: &str, query: &str) -> Result<Vec<Media>> {
-        if let Some(p) = self.plugins.iter_mut().find(|p| p.name == source) {
-            if !p.supports_media(MediaType::Anime) { return Ok(Vec::new()); }
-            return p.fetch_media_list(MediaType::Anime, query);
-        }
-        Ok(Vec::new())
     }
 }

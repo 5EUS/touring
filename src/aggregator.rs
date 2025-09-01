@@ -339,6 +339,17 @@ impl Aggregator {
         self.rt.block_on(async move { dao::upsert_source(&pool, &dao::SourceInsert { id: id.to_string(), version: version.to_string() }).await })
     }
 
+    pub fn clear_cache_prefix(&self, prefix: Option<&str>) -> Result<u64> {
+        let db = self.db.clone();
+        // Database is cheap to clone; execute in internal runtime
+        self.rt.block_on(async { db.clear_cache_prefix(prefix).await.map_err(Into::into) })
+    }
+
+    pub fn vacuum_db(&self) -> Result<()> {
+        let db = self.db.clone();
+        self.rt.block_on(async { db.vacuum().await.map_err(Into::into) })
+    }
+
     fn norm_query(q: &str) -> String {
         let trimmed = q.trim().to_ascii_lowercase();
         let mut out = String::with_capacity(trimmed.len());

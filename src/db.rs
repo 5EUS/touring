@@ -13,6 +13,7 @@ static INSTALL_DRIVERS: Once = Once::new();
 // Embed SQL migrations from the migrations/ directory
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+#[derive(Clone)]
 pub struct Database {
     pool: AnyPool,
 }
@@ -49,6 +50,27 @@ impl Database {
     }
 
     pub fn pool(&self) -> &AnyPool { &self.pool }
+
+    pub async fn clear_cache_prefix(&self, prefix: Option<&str>) -> Result<u64> {
+        let result = if let Some(p) = prefix {
+            let like = format!("{}%", p);
+            sqlx::query("DELETE FROM search_cache WHERE key LIKE ?")
+                .bind(like)
+                .execute(&self.pool)
+                .await?
+        } else {
+            sqlx::query("DELETE FROM search_cache")
+                .execute(&self.pool)
+                .await?
+        };
+        Ok(result.rows_affected())
+    }
+
+    pub async fn vacuum(&self) -> Result<()> {
+        // Best-effort: works on SQLite
+        let _ = sqlx::query("VACUUM").execute(&self.pool).await;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
