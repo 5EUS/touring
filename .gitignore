@@ -30,4 +30,7 @@ Desktop.ini
 /plugin-interface/wit/deps
 /plugin-interface/wit/_cache
 
+/touring-bridge/target
+/touring-bridge/Cargo.lock
+
 /test
