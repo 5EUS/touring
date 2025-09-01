@@ -1,0 +1,51 @@
+use crate::dao::{SeriesInsert, SeriesSourceInsert, ChapterInsert};
+use crate::plugins::{Media, MediaType, Unit, UnitKind};
+
+fn kind_str(mt: &MediaType) -> &'static str {
+    match mt {
+        MediaType::Manga => "manga",
+        MediaType::Anime => "anime",
+        MediaType::Other(_) => "other",
+    }
+}
+
+pub fn series_id_from(source_id: &str, media: &Media) -> String {
+    format!("series:{}:{}:{}", source_id, kind_str(&media.mediatype), media.id)
+}
+
+pub fn chapter_id_from(source_id: &str, unit: &Unit) -> String {
+    let kind = match unit.kind { UnitKind::Chapter => "chapter", UnitKind::Episode => "episode", UnitKind::Section => "section", UnitKind::Other(_) => "unit" };
+    format!("{}:{}:{}", source_id, kind, unit.id)
+}
+
+pub fn series_insert_from_media(id: &str, media: &Media) -> SeriesInsert {
+    SeriesInsert {
+        id: id.to_string(),
+        kind: kind_str(&media.mediatype).to_string(),
+        title: media.title.clone(),
+        alt_titles: None,
+        description: media.description.clone(),
+        cover_url: media.cover_url.clone(),
+        tags: None,
+        status: None,
+    }
+}
+
+pub fn series_source_from(series_id: &str, source_id: &str, external_id: &str) -> SeriesSourceInsert {
+    SeriesSourceInsert { series_id: series_id.to_string(), source_id: source_id.to_string(), external_id: external_id.to_string() }
+}
+
+pub fn chapter_insert_from_unit(id: &str, series_id: &str, source_id: &str, u: &Unit) -> ChapterInsert {
+    ChapterInsert {
+        id: id.to_string(),
+        series_id: series_id.to_string(),
+        source_id: source_id.to_string(),
+        external_id: u.id.clone(),
+        number_text: u.number_text.clone(),
+        number_num: u.number.map(|n| n as f64),
+        title: Some(u.title.clone()).filter(|s| !s.is_empty()),
+        lang: u.lang.clone(),
+        volume: u.group.clone(),
+        published_at: u.published_at.clone(),
+    }
+}

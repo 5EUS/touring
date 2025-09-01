@@ -5,6 +5,8 @@ use sqlx::any::AnyPoolOptions;
 use std::{path::PathBuf, str::FromStr};
 use std::sync::Once;
 
+use crate::storage::Storage;
+
 // Ensure drivers are installed exactly once for sqlx::any
 static INSTALL_DRIVERS: Once = Once::new();
 
@@ -49,6 +51,32 @@ impl Database {
     pub fn pool(&self) -> &AnyPool { &self.pool }
 }
 
+#[async_trait::async_trait]
+impl Storage for Database {
+    async fn get_cache(&self, key: &str, now: i64) -> Result<Option<String>> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT payload FROM search_cache WHERE key = ? AND expires_at > ?",
+        )
+        .bind(key)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn put_cache(&self, key: &str, payload: &str, expires_at: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO search_cache(key, payload, expires_at) VALUES (?, ?, ?)\n             ON CONFLICT(key) DO UPDATE SET payload=excluded.payload, expires_at=excluded.expires_at",
+        )
+        .bind(key)
+        .bind(payload)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
 fn default_sqlite_url() -> Result<String> {
     let proj = ProjectDirs::from("dev", "touring", "touring")
         .context("unable to determine data directory for default sqlite path")?;
@@ -69,8 +97,6 @@ fn default_sqlite_url() -> Result<String> {
 
     // Encode spaces in the path for a valid sqlite URL
     let mut path_str = path.to_string_lossy().to_string();
-    if path_str.contains(' ') {
-        path_str = path_str.replace(' ', "%20");
-    }
+    if path_str.contains(' ') { path_str = path_str.replace(' ', "%20"); }
     Ok(format!("sqlite:///{path_str}?mode=rwc"))
 }

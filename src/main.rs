@@ -2,6 +2,9 @@ mod cli;
 mod plugins;
 mod db;
 mod aggregator;
+mod storage;
+mod dao;
+mod mapping;
 
 use cli::{Cli, Commands};
 use clap::Parser;

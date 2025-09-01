@@ -150,6 +150,21 @@ impl PluginManager {
         Ok(all)
     }
 
+    // With source id exposure
+    pub fn search_manga_with_sources(&mut self, query: &str) -> Result<Vec<(String, Media)>> {
+        let mut all = Vec::new();
+        for plugin in &mut self.plugins {
+            match plugin.fetch_media_list(MediaType::Manga, query) {
+                Ok(v) => {
+                    let source_id = plugin.name.clone();
+                    for m in v { all.push((source_id.clone(), m)); }
+                }
+                Err(e) => eprintln!("Plugin failed fetchmedialist: {}", e),
+            }
+        }
+        Ok(all)
+    }
+
     pub fn get_manga_chapters(&mut self, manga_id: &str) -> Result<Vec<Unit>> {
         for plugin in &mut self.plugins {
             match plugin.fetch_units(manga_id) {
@@ -164,6 +179,22 @@ impl PluginManager {
             }
         }
         Ok(Vec::new())
+    }
+
+    pub fn get_manga_chapters_with_source(&mut self, manga_id: &str) -> Result<(Option<String>, Vec<Unit>)> {
+        for plugin in &mut self.plugins {
+            match plugin.fetch_units(manga_id) {
+                Ok(units) => {
+                    let chapters: Vec<Unit> = units
+                        .into_iter()
+                        .filter(|u| matches!(u.kind, UnitKind::Chapter))
+                        .collect();
+                    if !chapters.is_empty() { return Ok((Some(plugin.name.clone()), chapters)); }
+                }
+                Err(e) => eprintln!("Plugin failed fetchunits: {}", e),
+            }
+        }
+        Ok((None, Vec::new()))
     }
 
     pub fn get_chapter_images(&mut self, chapter_id: &str) -> Result<Vec<String>> {
@@ -181,6 +212,23 @@ impl PluginManager {
             }
         }
         Ok(Vec::new())
+    }
+
+    pub fn get_chapter_images_with_source(&mut self, chapter_id: &str) -> Result<(Option<String>, Vec<String>)> {
+        for plugin in &mut self.plugins {
+            match plugin.fetch_assets(chapter_id) {
+                Ok(assets) => {
+                    let urls: Vec<String> = assets
+                        .into_iter()
+                        .filter(|a| matches!(a.kind, AssetKind::Page | AssetKind::Image))
+                        .map(|a| a.url)
+                        .collect();
+                    if !urls.is_empty() { return Ok((Some(plugin.name.clone()), urls)); }
+                }
+                Err(e) => eprintln!("Plugin failed fetchassets: {}", e),
+            }
+        }
+        Ok((None, Vec::new()))
     }
 
     // Optional anime helpers using generic interface
