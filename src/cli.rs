@@ -22,10 +22,4 @@ pub enum Commands {
         /// Query to search for
         query: String,
     },
-    /// Debug a specific module
-    Debug {
-        /// Module name to debug
-        #[arg(short, long)]
-        module: String,
-    },
 }

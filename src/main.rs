@@ -18,44 +18,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-    Commands::Plugins { name } => {
-        if let Some(name) = name {
-            println!("Filtering plugins by name: {}", name);
+        Commands::Plugins { name } => {
+            if let Some(name) = name {
+                println!("Filtering plugins by name: {}", name);
 
-        } else {
-            println!("Listing all plugins...");
-            for plugin_name in pm.list_plugins() {
-                println!("  - {}", plugin_name);
-            }
-        }
-    }
-    Commands::Manga { query } => {
-        println!("Fetching manga list for query: {}", query);
-        if pm.list_plugins().is_empty() {
-            eprintln!("No plugins loaded");
-            return Ok(());
-        }
-        // Execute plugins synchronously - HTTP requests will create their own runtime internally
-        match pm.search_manga(&query) {
-            Ok(manga_list) => {
-                for manga in manga_list {
-                    println!("Manga: {} (ID: {})", manga.title, manga.id);
-                    if let Some(description) = &manga.description {
-                        println!("  Description: {}", description);
-                    }
-                    if let Some(url) = &manga.url {
-                        println!("  URL: {}", url);
-                    }
+            } else {
+                println!("Listing all plugins...");
+                for plugin_name in pm.list_plugins() {
+                    println!("  - {}", plugin_name);
                 }
             }
-            Err(e) => eprintln!("Error fetching manga list: {}", e),
+        }
+        Commands::Manga { query } => {
+            println!("Fetching manga list for query: {}", query);
+            if pm.list_plugins().is_empty() {
+                eprintln!("No plugins loaded");
+                return Ok(());
+            }
+            // Execute plugins synchronously - HTTP requests will create their own runtime internally
+            match pm.search_manga(&query) {
+                Ok(manga_list) => {
+                    for manga in manga_list {
+                        println!("Manga: {} (ID: {})", manga.title, manga.id);
+                        if let Some(description) = &manga.description {
+                            println!("  Description: {}", description);
+                        }
+                        if let Some(url) = &manga.url {
+                            println!("  URL: {}", url);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error fetching manga list: {}", e),
+            }
         }
     }
-    Commands::Debug { module } => {
-        println!("Debugging module: {}", module);
-        // Add debugging logic here
-    }
-    }
-    
     Ok(())
 }
