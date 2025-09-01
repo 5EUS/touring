@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "../mangadex_plugin"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../test_plugin"
+		},
+		{
+			"path": "../nefarious_plugin"
+		}
+	],
+	"settings": {}
+}
