@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "plugin-interface"]
+members = [".", "plugin-interface", "touring-bridge"]
 
 [package]
 name = "touring"

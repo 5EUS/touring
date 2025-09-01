@@ -8,6 +8,7 @@ use std::sync::{Arc, atomic::{AtomicU64, AtomicBool, Ordering}};
 use std::sync::mpsc::{self, Sender, Receiver};
 use serde::Deserialize;
 use std::fs;
+use url::Url;
 
 // Generate WIT bindings from shared plugin-interface (generic library world)
 wasmtime::component::bindgen!({
@@ -44,6 +45,7 @@ struct Plugin {
     last_call: Option<Instant>,
     epoch_ticks: Arc<AtomicU64>,
     epoch_interval: Duration,
+    allowed_hosts: Option<Vec<String>>,
     _instance: wasmtime::component::Instance,
     _component: Component,
 }
@@ -51,7 +53,7 @@ struct Plugin {
 #[derive(Debug, Deserialize, Clone, Default)]
 struct PluginConfig {
     #[serde(default)]
-    allowed_hosts: Vec<String>,
+    allowed_hosts: Option<Vec<String>>,
     #[serde(default)]
     user_agent: Option<String>,
     #[serde(default)]
@@ -70,15 +72,21 @@ impl Plugin {
             .ok()
             .and_then(|s| toml::from_str(&s).ok())
             .unwrap_or_default();
+        let allowed_hosts: Option<Vec<String>> = cfg.allowed_hosts.as_ref().map(|v|
+            v.iter().map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()
+        );
 
         // Initialize WASI context for the plugin
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdout().inherit_stderr().inherit_env();
+        if let Some(list) = &allowed_hosts {
+            builder.env("TOURING_ALLOWED_HOSTS", list.join(","));
+        }
         let wasi = builder.build();
 
         // Build HTTP context and apply simple allowlist via environment check inside guest
         let http = WasiHttpCtx::new();
-        // Note: wasmtime-wasi-http 28.0.0 has no direct API to set host allowlist; we enforce in guest or via config headers.
+        // Note: wasmtime-wasi-http 28.0.0 has no direct API to set host allowlist; we enforce at host output boundary and signal via env.
 
         let host = Host { 
             wasi,
@@ -117,6 +125,7 @@ impl Plugin {
             last_call: None,
             epoch_ticks,
             epoch_interval,
+            allowed_hosts,
             _instance: instance,
             _component: component,
         };
@@ -130,60 +139,33 @@ impl Plugin {
         Ok(plugin)
     }
 
-    fn set_deadline(&mut self) {
-        // Convert timeout into epoch ticks (absolute deadline)
-        let now = self.epoch_ticks.load(Ordering::Relaxed);
-        let per_tick_ms = self.epoch_interval.as_millis().max(1) as u128;
-        let need = ((self.call_timeout.as_millis() + per_tick_ms - 1) / per_tick_ms) as u64;
-        let deadline = now.saturating_add(need);
-        self.store.set_epoch_deadline(deadline);
-    }
-
-    fn clear_deadline(&mut self) {
-        // Move deadline far into the future without risking overflow
-        let now = self.epoch_ticks.load(Ordering::Relaxed);
-        let far = now.saturating_add(1_000_000_000); // ~10^9 ticks ahead
-        self.store.set_epoch_deadline(far);
-    }
-
-    fn throttle(&mut self) {
-        if let Some(last) = self.last_call {
-            let elapsed = last.elapsed();
-            if elapsed < self.rate_limit {
-                std::thread::sleep(self.rate_limit - elapsed);
-            }
-        }
-        self.last_call = Some(Instant::now());
-    }
-
-    fn warn_if_slow(&self, start: Instant, op: &str) {
-        let elapsed = start.elapsed();
-        if elapsed > self.slow_warn {
-            eprintln!("Plugin {} {} took {:?}", self.name, op, elapsed);
-        }
-    }
-
-    fn retry_once<T, F>(&mut self, mut f: F, op: &str) -> Result<T>
-    where F: FnMut(&mut Self) -> Result<T> {
-        for attempt in 0..2 {
-            self.set_deadline();
-            let res = f(self);
-            self.clear_deadline();
-            match res {
-                Ok(v) => return Ok(v),
-                Err(e1) if attempt == 0 => {
-                    eprintln!("Plugin {} {} failed: {}. Retrying...", self.name, op, e1);
-                    std::thread::sleep(Duration::from_millis(200));
-                    continue;
+    fn url_allowed(&self, url: &str) -> bool {
+        match &self.allowed_hosts {
+            None => true, // not configured -> allow all (back-compat)
+            Some(list) => {
+                if list.is_empty() { return false; }
+                let Ok(parsed) = Url::parse(url) else { return false; };
+                match parsed.scheme() {
+                    "http" | "https" => {}
+                    _ => return false,
                 }
-                Err(e) => return Err(anyhow!("{} after retry: {}", op, e)),
+                let Some(host) = parsed.host_str() else { return false; };
+                let host = host.to_ascii_lowercase();
+                list.iter().any(|allowed| {
+                    let a = allowed.as_str();
+                    if let Some(stripped) = a.strip_prefix("*.") {
+                        host == stripped || host.ends_with(&format!(".{}", stripped))
+                    } else {
+                        host == a
+                    }
+                })
             }
         }
-        unreachable!();
     }
 
     // Generic methods
     fn fetch_media_list(&mut self, kind: MediaType, query: &str) -> Result<Vec<Media>> {
+        if matches!(&self.allowed_hosts, Some(v) if v.is_empty()) { return Ok(Vec::new()); }
         self.throttle();
         self.set_deadline();
         let start = Instant::now();
@@ -194,10 +176,17 @@ impl Plugin {
         }, "fetchmedialist");
         self.clear_deadline();
         self.warn_if_slow(start, "fetchmedialist");
-        res
+        let mut list = res?;
+        // Sanitize URLs against allowlist
+        for m in &mut list {
+            if let Some(u) = &m.url { if !self.url_allowed(u) { m.url = None; } }
+            if let Some(c) = &m.cover_url { if !self.url_allowed(c) { m.cover_url = None; } }
+        }
+        Ok(list)
     }
 
     fn fetch_units(&mut self, media_id: &str) -> Result<Vec<Unit>> {
+        if matches!(&self.allowed_hosts, Some(v) if v.is_empty()) { return Ok(Vec::new()); }
         self.throttle();
         self.set_deadline();
         let start = Instant::now();
@@ -208,10 +197,15 @@ impl Plugin {
         }, "fetchunits");
         self.clear_deadline();
         self.warn_if_slow(start, "fetchunits");
-        res
+        let mut units = res?;
+        for u in &mut units {
+            if let Some(uurl) = &u.url { if !self.url_allowed(uurl) { u.url = None; } }
+        }
+        Ok(units)
     }
 
     fn fetch_assets(&mut self, unit_id: &str) -> Result<Vec<Asset>> {
+        if matches!(&self.allowed_hosts, Some(v) if v.is_empty()) { return Ok(Vec::new()); }
         self.throttle();
         self.set_deadline();
         let start = Instant::now();
@@ -222,7 +216,9 @@ impl Plugin {
         }, "fetchassets");
         self.clear_deadline();
         self.warn_if_slow(start, "fetchassets");
-        res
+        let assets = res?;
+        let filtered: Vec<Asset> = assets.into_iter().filter(|a| self.url_allowed(&a.url)).collect();
+        Ok(filtered)
     }
 
     fn get_capabilities_refresh(&mut self) -> Result<ProviderCapabilities> {
@@ -267,6 +263,58 @@ impl Plugin {
             ),
             None => true,
         }
+    }
+
+    fn set_deadline(&mut self) {
+        // Convert timeout into epoch ticks (absolute deadline)
+        let now = self.epoch_ticks.load(Ordering::Relaxed);
+        let per_tick_ms = self.epoch_interval.as_millis().max(1) as u128;
+        let need = ((self.call_timeout.as_millis() + per_tick_ms - 1) / per_tick_ms) as u64;
+        let deadline = now.saturating_add(need);
+        self.store.set_epoch_deadline(deadline);
+    }
+
+    fn clear_deadline(&mut self) {
+        // Move deadline far into the future without risking overflow
+        let now = self.epoch_ticks.load(Ordering::Relaxed);
+        let far = now.saturating_add(1_000_000_000);
+        self.store.set_epoch_deadline(far);
+    }
+
+    fn throttle(&mut self) {
+        if let Some(last) = self.last_call {
+            let elapsed = last.elapsed();
+            if elapsed < self.rate_limit {
+                std::thread::sleep(self.rate_limit - elapsed);
+            }
+        }
+        self.last_call = Some(Instant::now());
+    }
+
+    fn warn_if_slow(&self, start: Instant, op: &str) {
+        let elapsed = start.elapsed();
+        if elapsed > self.slow_warn {
+            eprintln!("Plugin {} {} took {:?}", self.name, op, elapsed);
+        }
+    }
+
+    fn retry_once<T, F>(&mut self, mut f: F, op: &str) -> Result<T>
+    where F: FnMut(&mut Self) -> Result<T> {
+        for attempt in 0..2 {
+            self.set_deadline();
+            let res = f(self);
+            self.clear_deadline();
+            match res {
+                Ok(v) => return Ok(v),
+                Err(e1) if attempt == 0 => {
+                    eprintln!("Plugin {} {} failed: {}. Retrying...", self.name, op, e1);
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                Err(e) => return Err(anyhow!("{} after retry: {}", op, e)),
+            }
+        }
+        unreachable!();
     }
 }
 
