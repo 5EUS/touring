@@ -17,11 +17,10 @@ pub enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
-    /// Interact with sources
-    Source {
-        /// Fetch manga list by query
-        #[arg(short, long)]
-        query: Option<String>,
+    /// Search for manga
+    Manga {
+        /// Query to search for
+        query: String,
     },
     /// Debug a specific module
     Debug {

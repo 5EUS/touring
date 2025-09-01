@@ -24,3 +24,8 @@ Desktop.ini
 *.iml
 
 /plugins
+
+/plugin-interface/target
+/plugin-interface/Cargo.lock
+/plugin-interface/wit/deps
+/plugin-interface/wit/_cache
