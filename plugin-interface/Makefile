@@ -3,7 +3,7 @@
 
 WIT_DIR := $(CURDIR)/wit
 SRC_DIR := $(CURDIR)/src
-WORLD   := source
+WORLD   := library
 
 # Generated binding files
 HOST_BINDINGS := $(SRC_DIR)/host.rs
@@ -56,14 +56,14 @@ $(HOST_BINDINGS): $(WIT_DIR)/world.wit
 	@mkdir -p $(SRC_DIR)
 	@echo "Generating host bindings..."
 	@wit-bindgen rust --generate-all --world $(WORLD) --out-dir $(SRC_DIR) $(WIT_DIR)
-	@mv $(SRC_DIR)/source.rs $(HOST_BINDINGS) 2>/dev/null || cp $(SRC_DIR)/source.rs $(HOST_BINDINGS)
+	@mv $(SRC_DIR)/library.rs $(HOST_BINDINGS) 2>/dev/null || cp $(SRC_DIR)/library.rs $(HOST_BINDINGS)
 	@command -v rustfmt >/dev/null 2>&1 && rustfmt $(HOST_BINDINGS) || true
 
 $(GUEST_BINDINGS): $(WIT_DIR)/world.wit
 	@mkdir -p $(SRC_DIR)
 	@echo "Generating guest bindings..."
 	@wit-bindgen rust --generate-all --world $(WORLD) --out-dir $(SRC_DIR) $(WIT_DIR)
-	@cp $(SRC_DIR)/source.rs $(GUEST_BINDINGS)
+	@cp $(SRC_DIR)/library.rs $(GUEST_BINDINGS)
 	@command -v rustfmt >/dev/null 2>&1 && rustfmt $(GUEST_BINDINGS) || true
 
 # Check dependencies

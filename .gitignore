@@ -29,3 +29,5 @@ Desktop.ini
 /plugin-interface/Cargo.lock
 /plugin-interface/wit/deps
 /plugin-interface/wit/_cache
+
+/test

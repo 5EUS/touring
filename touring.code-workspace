@@ -7,9 +7,6 @@
 			"path": "."
 		},
 		{
-			"path": "../test_plugin"
-		},
-		{
 			"path": "../nefarious_plugin"
 		}
 	],

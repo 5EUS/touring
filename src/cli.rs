@@ -5,6 +5,15 @@ use clap::{Parser, Subcommand};
 #[command(name = "touring")]
 #[command(about = "A CLI tool for managing plugins and sources", long_about = None)]
 pub struct Cli {
+    /// Database connection string (sqlite/postgres/mysql). If not provided, a sensible
+    /// default is used (sqlite file in user data dir). Can also be set via TOURING_DATABASE_URL.
+    #[arg(long = "database-url")]
+    pub database_url: Option<String>,
+
+    /// Skip running migrations on startup. Can also be set via TOURING_NO_MIGRATIONS.
+    #[arg(long = "no-migrations", default_value_t = false)]
+    pub no_migrations: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }

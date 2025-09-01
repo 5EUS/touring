@@ -1,24 +1,21 @@
-package touring:source;
+package touring:library;
 
-world source {
-  /// Fetch a list of manga by query
-  export fetchmangalist: func(query: string) -> list<media>;
+// Generic world for highly extensible aggregation
+world library {
+  /// Generic media discovery for any supported media type.
+  /// Implementors should return an empty list for unsupported types.
+  export fetchmedialist: func(kind: media-type, query: string) -> list<media>;
 
-  /// Fetch a list of chapters by query
-  export fetchmangachapterlist: func(query: string) -> list<media>;
+  /// Generic unit listing for a given media id (e.g. chapters, episodes, sections).
+  export fetchunits: func(mediaid: string) -> list<unit>;
 
-  /// Fetch all image URLs for a given chapter
-  export fetchchapterimages: func(chapterid: string) -> list<string>;
+  /// Generic asset retrieval for a given unit id (e.g. pages, images, streams, files).
+  export fetchassets: func(unitid: string) -> list<asset>;
 
-  /// Fetch a list of anime by query
-  export fetchanimelist: func(query: string) -> list<media>;
+  /// Report provider capabilities so the host can adapt behavior.
+  export getcapabilities: func() -> provider-capabilities;
 
-  /// Fetch all episodes for a given anime id
-  export fetchanimeepisodes: func(animeid: string) -> list<episode>;
-
-  /// Fetch available stream URLs for a given episode id
-  export fetchepisodestreams: func(episodeid: string) -> list<mediastream>;
-
+  // -------------------- Types --------------------
   variant media-type {
     anime,
     manga,
@@ -30,26 +27,67 @@ world source {
     mediatype: media-type,
     title: string,
     description: option<string>,
+    /// Link to the media page on the provider
     url: option<string>,
+    /// Optional cover/thumbnail image URL
+    cover-url: option<string>,
   }
 
-  /// Describes an anime episode
-  record episode {
+  /// Neutral unit representing a serializable subdivision of a media item.
+  /// Example: chapter (manga/comic), episode (anime/tv), section (book/textbook).
+  variant unit-kind {
+    chapter,
+    episode,
+    section,
+    other(string),
+  }
+
+  record unit {
     id: string,
     title: string,
-    /// Optional numeric episode number (e.g. 1, 12.5)
+    /// Raw ordinal label as provided by the source (e.g. "12.5", "Part II")
+    number-text: option<string>,
+    /// Parsed numeric ordinal for sorting when available
     number: option<f32>,
-    /// Optional link to the episode page on the provider
+    /// ISO language code (e.g. "en")
+    lang: option<string>,
+    /// Optional grouping label such as volume/season/part
+    group: option<string>,
+    /// Optional direct link to the unit page
     url: option<string>,
+    /// RFC3339/ISO8601 timestamp string if available
+    published-at: option<string>,
+    /// The unit kind
+    kind: unit-kind,
   }
 
-  /// Describes a playable stream
-  record mediastream {
-    /// Direct or playlist URL (e.g. m3u8)
+  /// Generic asset exposed by a unit (page/image/audio/video/subtitle/file links).
+  variant asset-kind {
+    page,
+    image,
+    audio,
+    video,
+    subtitle,
+    file,
+    other(string),
+  }
+
+  record asset {
+    /// Direct URL to the asset
     url: string,
-    /// Optional quality label (e.g. "1080p", "720p")
-    quality: option<string>,
-    /// Optional MIME type (e.g. "application/vnd.apple.mpegurl", "video/mp4")
+    /// Optional MIME type
     mime: option<string>,
+    /// Optional pixel width/height (for visual assets)
+    width: option<u32>,
+    height: option<u32>,
+    /// Kind of asset
+    kind: asset-kind,
+  }
+
+  /// Provider capability advertisement for adaptive host behavior.
+  record provider-capabilities {
+    media-types: list<media-type>,
+    unit-kinds: list<unit-kind>,
+    asset-kinds: list<asset-kind>,
   }
 }

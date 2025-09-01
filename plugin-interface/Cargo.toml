@@ -11,3 +11,7 @@ wit-bindgen = "0.45.0"
 default = []
 host = []
 guest = []
+
+[lib]
+name = "plugin_interface"
+path = "src/library.rs"
