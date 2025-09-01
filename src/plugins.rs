@@ -32,6 +32,7 @@ struct Plugin {
     name: String,
     store: Store<Host>,
     bindings: Library,
+    caps: Option<ProviderCapabilities>,
     _instance: wasmtime::component::Instance,
     _component: Component,
 }
@@ -60,10 +61,17 @@ impl Plugin {
         let instance = linker.instantiate(&mut store, &component)?;
         let bindings = Library::new(&mut store, &instance)?;
 
+        // Try to read provider capabilities now and cache them
+        let caps = match bindings.call_getcapabilities(&mut store) {
+            Ok(c) => Some(c),
+            Err(e) => { eprintln!("Failed to get capabilities for {}: {}", plugin_path.display(), e); None }
+        };
+
         Ok(Self {
             name: plugin_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string(),
             store,
             bindings,
+            caps,
             _instance: instance,
             _component: component,
         })
@@ -92,6 +100,33 @@ impl Plugin {
         self.bindings
             .call_getcapabilities(&mut self.store)
             .map_err(|e| anyhow!("Failed to call getcapabilities: {}", e))
+    }
+
+    fn supports_media(&self, target: MediaType) -> bool {
+        match &self.caps {
+            Some(c) => c.media_types.iter().any(|mt|
+                matches!((mt, &target), (MediaType::Manga, MediaType::Manga) | (MediaType::Anime, MediaType::Anime))
+            ),
+            None => true,
+        }
+    }
+
+    fn supports_unit(&self, target: UnitKind) -> bool {
+        match &self.caps {
+            Some(c) => c.unit_kinds.iter().any(|uk|
+                matches!((uk, &target), (UnitKind::Chapter, UnitKind::Chapter) | (UnitKind::Episode, UnitKind::Episode))
+            ),
+            None => true,
+        }
+    }
+
+    fn supports_asset(&self, target: AssetKind) -> bool {
+        match &self.caps {
+            Some(c) => c.asset_kinds.iter().any(|ak|
+                matches!((ak, &target), (AssetKind::Page, AssetKind::Page) | (AssetKind::Image, AssetKind::Image) | (AssetKind::Video, AssetKind::Video))
+            ),
+            None => true,
+        }
     }
 }
 
@@ -142,6 +177,7 @@ impl PluginManager {
     pub fn search_manga(&mut self, query: &str) -> Result<Vec<Media>> {
         let mut all = Vec::new();
         for plugin in &mut self.plugins {
+            if !plugin.supports_media(MediaType::Manga) { continue; }
             match plugin.fetch_media_list(MediaType::Manga, query) {
                 Ok(mut v) => all.append(&mut v),
                 Err(e) => eprintln!("Plugin failed fetchmedialist: {}", e),
@@ -154,6 +190,7 @@ impl PluginManager {
     pub fn search_manga_with_sources(&mut self, query: &str) -> Result<Vec<(String, Media)>> {
         let mut all = Vec::new();
         for plugin in &mut self.plugins {
+            if !plugin.supports_media(MediaType::Manga) { continue; }
             match plugin.fetch_media_list(MediaType::Manga, query) {
                 Ok(v) => {
                     let source_id = plugin.name.clone();
@@ -167,6 +204,7 @@ impl PluginManager {
 
     pub fn get_manga_chapters(&mut self, manga_id: &str) -> Result<Vec<Unit>> {
         for plugin in &mut self.plugins {
+            if !plugin.supports_unit(UnitKind::Chapter) { continue; }
             match plugin.fetch_units(manga_id) {
                 Ok(units) => {
                     let chapters: Vec<Unit> = units
@@ -183,6 +221,7 @@ impl PluginManager {
 
     pub fn get_manga_chapters_with_source(&mut self, manga_id: &str) -> Result<(Option<String>, Vec<Unit>)> {
         for plugin in &mut self.plugins {
+            if !plugin.supports_unit(UnitKind::Chapter) { continue; }
             match plugin.fetch_units(manga_id) {
                 Ok(units) => {
                     let chapters: Vec<Unit> = units
@@ -199,6 +238,7 @@ impl PluginManager {
 
     pub fn get_chapter_images(&mut self, chapter_id: &str) -> Result<Vec<String>> {
         for plugin in &mut self.plugins {
+            if !(plugin.supports_asset(AssetKind::Page) || plugin.supports_asset(AssetKind::Image)) { continue; }
             match plugin.fetch_assets(chapter_id) {
                 Ok(assets) => {
                     let urls: Vec<String> = assets
@@ -216,6 +256,7 @@ impl PluginManager {
 
     pub fn get_chapter_images_with_source(&mut self, chapter_id: &str) -> Result<(Option<String>, Vec<String>)> {
         for plugin in &mut self.plugins {
+            if !(plugin.supports_asset(AssetKind::Page) || plugin.supports_asset(AssetKind::Image)) { continue; }
             match plugin.fetch_assets(chapter_id) {
                 Ok(assets) => {
                     let urls: Vec<String> = assets
@@ -235,6 +276,7 @@ impl PluginManager {
     pub fn search_anime(&mut self, query: &str) -> Result<Vec<Media>> {
         let mut all = Vec::new();
         for plugin in &mut self.plugins {
+            if !plugin.supports_media(MediaType::Anime) { continue; }
             match plugin.fetch_media_list(MediaType::Anime, query) {
                 Ok(mut v) => all.append(&mut v),
                 Err(e) => eprintln!("Plugin failed fetchmedialist: {}", e),
@@ -243,8 +285,24 @@ impl PluginManager {
         Ok(all)
     }
 
+    pub fn search_anime_with_sources(&mut self, query: &str) -> Result<Vec<(String, Media)>> {
+        let mut all = Vec::new();
+        for plugin in &mut self.plugins {
+            if !plugin.supports_media(MediaType::Anime) { continue; }
+            match plugin.fetch_media_list(MediaType::Anime, query) {
+                Ok(v) => {
+                    let source_id = plugin.name.clone();
+                    for m in v { all.push((source_id.clone(), m)); }
+                }
+                Err(e) => eprintln!("Plugin failed fetchmedialist: {}", e),
+            }
+        }
+        Ok(all)
+    }
+
     pub fn get_anime_episodes(&mut self, anime_id: &str) -> Result<Vec<Unit>> {
         for plugin in &mut self.plugins {
+            if !plugin.supports_unit(UnitKind::Episode) { continue; }
             match plugin.fetch_units(anime_id) {
                 Ok(units) => {
                     let eps: Vec<Unit> = units
@@ -259,8 +317,26 @@ impl PluginManager {
         Ok(Vec::new())
     }
 
+    pub fn get_anime_episodes_with_source(&mut self, anime_id: &str) -> Result<(Option<String>, Vec<Unit>)> {
+        for plugin in &mut self.plugins {
+            if !plugin.supports_unit(UnitKind::Episode) { continue; }
+            match plugin.fetch_units(anime_id) {
+                Ok(units) => {
+                    let eps: Vec<Unit> = units
+                        .into_iter()
+                        .filter(|u| matches!(u.kind, UnitKind::Episode))
+                        .collect();
+                    if !eps.is_empty() { return Ok((Some(plugin.name.clone()), eps)); }
+                }
+                Err(e) => eprintln!("Plugin failed fetchunits: {}", e),
+            }
+        }
+        Ok((None, Vec::new()))
+    }
+
     pub fn get_episode_streams(&mut self, episode_id: &str) -> Result<Vec<Asset>> {
         for plugin in &mut self.plugins {
+            if !plugin.supports_asset(AssetKind::Video) { continue; }
             match plugin.fetch_assets(episode_id) {
                 Ok(assets) => {
                     let vids: Vec<Asset> = assets
@@ -273,5 +349,22 @@ impl PluginManager {
             }
         }
         Ok(Vec::new())
+    }
+
+    pub fn get_episode_streams_with_source(&mut self, episode_id: &str) -> Result<(Option<String>, Vec<Asset>)> {
+        for plugin in &mut self.plugins {
+            if !plugin.supports_asset(AssetKind::Video) { continue; }
+            match plugin.fetch_assets(episode_id) {
+                Ok(assets) => {
+                    let vids: Vec<Asset> = assets
+                        .into_iter()
+                        .filter(|a| matches!(a.kind, AssetKind::Video))
+                        .collect();
+                    if !vids.is_empty() { return Ok((Some(plugin.name.clone()), vids)); }
+                }
+                Err(e) => eprintln!("Plugin failed fetchassets: {}", e),
+            }
+        }
+        Ok((None, Vec::new()))
     }
 }

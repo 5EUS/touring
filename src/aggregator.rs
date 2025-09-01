@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::db::Database;
-use crate::plugins::{PluginManager, Media, Unit, UnitKind, MediaType};
+use crate::plugins::{PluginManager, Media, Unit, UnitKind, MediaType, Asset, AssetKind};
 use crate::storage::Storage;
 use crate::dao;
 use crate::mapping::{series_insert_from_media, series_source_from, chapter_insert_from_unit};
@@ -65,6 +65,16 @@ impl Aggregator {
         Ok(results.into_iter().map(|(_, m)| m).collect())
     }
 
+    /// Search anime using all loaded plugins. Upserts series + mappings.
+    pub fn search_anime(&mut self, query: &str) -> Result<Vec<Media>> {
+        let results = self.pm.search_anime_with_sources(query)?;
+        for (source_id, media) in &results {
+            let _ = self.upsert_source(source_id, "unknown");
+            let _ = self.get_or_create_series_id(source_id, &media.id, media)?;
+        }
+        Ok(results.into_iter().map(|(_, m)| m).collect())
+    }
+
     /// Fetch chapters for a manga id. Upserts chapters linked to canonical series id.
     pub fn get_manga_chapters(&mut self, external_manga_id: &str) -> Result<Vec<Unit>> {
         let (source_opt, units) = self.pm.get_manga_chapters_with_source(external_manga_id)?;
@@ -75,9 +85,16 @@ impl Aggregator {
             let pool = self.db.pool().clone();
             self.rt.block_on(async {
                 for u in units.iter().filter(|u| matches!(u.kind, UnitKind::Chapter)) {
-                    let cid = uuid::Uuid::new_v4().to_string();
-                    let ch = chapter_insert_from_unit(&cid, &series_id, &source_id, u);
-                    let _ = dao::upsert_chapter(&pool, &ch).await;
+                    // Get or create chapter canonical id by mapping lookup
+                    if let Some(existing) = dao::find_chapter_id_by_mapping(&pool, &series_id, &source_id, &u.id).await? {
+                        // Update existing
+                        let ch = chapter_insert_from_unit(&existing, &series_id, &source_id, u);
+                        let _ = dao::upsert_chapter(&pool, &ch).await;
+                    } else {
+                        let cid = uuid::Uuid::new_v4().to_string();
+                        let ch = chapter_insert_from_unit(&cid, &series_id, &source_id, u);
+                        let _ = dao::upsert_chapter(&pool, &ch).await;
+                    }
                 }
                 Ok::<(), anyhow::Error>(())
             })?;
@@ -106,6 +123,76 @@ impl Aggregator {
         let _ = self.rt.block_on(self.db.put_cache(&key, &payload, expires_at));
 
         Ok(urls)
+    }
+
+    /// Fetch episode for an anime id. Upserts episodes linked to canonical series id.
+    pub fn get_anime_episodes(&mut self, external_anime_id: &str) -> Result<Vec<Unit>> {
+        let (source_opt, units) = self.pm.get_anime_episodes_with_source(external_anime_id)?;
+        if let Some(source_id) = source_opt {
+            // Build minimal Media for kind
+            let media_stub = Media { id: external_anime_id.to_string(), mediatype: MediaType::Anime, title: String::new(), description: None, url: None, cover_url: None };
+            let series_id = self.get_or_create_series_id(&source_id, external_anime_id, &media_stub)?;
+            let pool = self.db.pool().clone();
+            self.rt.block_on(async {
+                for u in units.iter().filter(|u| matches!(u.kind, UnitKind::Episode)) {
+                    if let Some(existing) = dao::find_episode_id_by_mapping(&pool, &series_id, &source_id, &u.id).await? {
+                        let ep = crate::dao::EpisodeInsert {
+                            id: existing,
+                            series_id: series_id.clone(),
+                            source_id: source_id.clone(),
+                            external_id: u.id.clone(),
+                            number_text: u.number_text.clone(),
+                            number_num: u.number.map(|n| n as f64),
+                            title: Some(u.title.clone()).filter(|s| !s.is_empty()),
+                            lang: u.lang.clone(),
+                            season: u.group.clone(),
+                            published_at: u.published_at.clone(),
+                        };
+                        let _ = dao::upsert_episode(&pool, &ep).await;
+                    } else {
+                        let eid = uuid::Uuid::new_v4().to_string();
+                        let ep = crate::dao::EpisodeInsert {
+                            id: eid,
+                            series_id: series_id.clone(),
+                            source_id: source_id.clone(),
+                            external_id: u.id.clone(),
+                            number_text: u.number_text.clone(),
+                            number_num: u.number.map(|n| n as f64),
+                            title: Some(u.title.clone()).filter(|s| !s.is_empty()),
+                            lang: u.lang.clone(),
+                            season: u.group.clone(),
+                            published_at: u.published_at.clone(),
+                        };
+                        let _ = dao::upsert_episode(&pool, &ep).await;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+        Ok(units)
+    }
+
+    /// Fetch video streams for an episode id and persist them (no cache yet).
+    pub fn get_episode_streams(&mut self, external_episode_id: &str) -> Result<Vec<Asset>> {
+        let (src_opt, vids) = self.pm.get_episode_streams_with_source(external_episode_id)?;
+        if let Some(source_id) = src_opt {
+            // Try to resolve canonical episode id by (source, external)
+            let pool = self.db.pool().clone();
+            self.rt.block_on(async {
+                if let Some(canonical_eid) = dao::find_episode_id_by_mapping(&pool, "%", &source_id, external_episode_id).await? {
+                    // Map assets -> streams and upsert
+                    let streams: Vec<crate::dao::StreamInsert> = vids.iter().map(|a| crate::dao::StreamInsert {
+                        episode_id: canonical_eid.clone(),
+                        url: a.url.clone(),
+                        quality: None,
+                        mime: a.mime.clone(),
+                    }).collect();
+                    let _ = dao::upsert_streams(&pool, &canonical_eid, &streams).await;
+                }
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+        Ok(vids)
     }
 
     /// Access to the underlying database for future extensions.

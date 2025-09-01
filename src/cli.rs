@@ -31,14 +31,29 @@ pub enum Commands {
         /// Query to search for
         query: String,
     },
+    /// Search for anime
+    Anime {
+        /// Query to search for
+        query: String,
+    },
     /// Get chapters for a specific manga
     Chapters {
         /// Manga ID to get chapters for
         manga_id: String,
     },
+    /// Get episodes for a specific anime
+    Episodes {
+        /// Anime ID to get episodes for
+        anime_id: String,
+    },
     /// Get chapter images
     Chapter {
         /// Chapter ID to retrieve images for
         chapter_id: String,
+    },
+    /// Get video streams for an episode
+    Streams {
+        /// Episode ID to retrieve streams for
+        episode_id: String,
     },
 }

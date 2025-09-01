@@ -210,3 +210,15 @@ pub async fn find_chapter_id_by_mapping(pool: &AnyPool, series_id: &str, source_
     .await?;
     Ok(id)
 }
+
+pub async fn find_episode_id_by_mapping(pool: &AnyPool, series_id: &str, source_id: &str, external_id: &str) -> Result<Option<String>> {
+    let id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM episodes WHERE series_id = ? AND source_id = ? AND external_id = ? LIMIT 1",
+    )
+    .bind(series_id)
+    .bind(source_id)
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}

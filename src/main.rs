@@ -60,6 +60,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("Error fetching manga list: {}", e),
             }
         }
+        Commands::Anime { query } => {
+            println!("Fetching anime list for query: {}", query);
+            if agg.list_plugins().is_empty() { eprintln!("No plugins loaded"); return Ok(()); }
+            match agg.search_anime(&query) {
+                Ok(list) => {
+                    for m in list { println!("Anime: {} (ID: {})", m.title, m.id); }
+                }
+                Err(e) => eprintln!("Error fetching anime list: {}", e),
+            }
+        }
         Commands::Chapters { manga_id } => {
             println!("Fetching chapters for manga ID: {}", manga_id);
             if agg.list_plugins().is_empty() { eprintln!("No plugins loaded"); return Ok(()); }
@@ -81,6 +91,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("Error fetching chapters: {}", e),
             }
         }
+        Commands::Episodes { anime_id } => {
+            println!("Fetching episodes for anime ID: {}", anime_id);
+            if agg.list_plugins().is_empty() { eprintln!("No plugins loaded"); return Ok(()); }
+            match agg.get_anime_episodes(&anime_id) {
+                Ok(units) => {
+                    if units.is_empty() { println!("No episodes found for anime ID: {}", anime_id); }
+                    else {
+                        println!("Found {} episodes for anime {}:", units.len(), anime_id);
+                        for u in units {
+                            let num = u.number.map(|n| n.to_string()).or(u.number_text.clone()).unwrap_or_default();
+                            println!("  {}: {}{}", u.id, if num.is_empty() { "".to_string() } else { format!("Ep. {} ", num) }, u.title);
+                            if let Some(lang) = &u.lang { println!("    lang: {}", lang); }
+                            if let Some(s) = &u.group { println!("    season: {}", s); }
+                            if let Some(p) = &u.published_at { println!("    published: {}", p); }
+                            if let Some(uurl) = &u.url { println!("    url: {}", uurl); }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error fetching episodes: {}", e),
+            }
+        }
         Commands::Chapter { chapter_id } => {
             println!("Fetching chapter images for chapter ID: {}", chapter_id);
             if agg.list_plugins().is_empty() { eprintln!("No plugins loaded"); return Ok(()); }
@@ -93,6 +124,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => eprintln!("Error fetching chapter images: {}", e),
+            }
+        }
+        Commands::Streams { episode_id } => {
+            println!("Fetching video streams for episode ID: {}", episode_id);
+            if agg.list_plugins().is_empty() { eprintln!("No plugins loaded"); return Ok(()); }
+            match agg.get_episode_streams(&episode_id) {
+                Ok(assets) => {
+                    if assets.is_empty() { println!("No streams found for episode ID: {}", episode_id); }
+                    else {
+                        println!("Found {} streams for episode {}:", assets.len(), episode_id);
+                        for a in assets { println!("  url: {}{}", a.url, a.mime.as_deref().map(|m| format!(" ({})", m)).unwrap_or_default()); }
+                    }
+                }
+                Err(e) => eprintln!("Error fetching streams: {}", e),
             }
         }
     }
