@@ -3,6 +3,8 @@ use anyhow::{anyhow, Result};
 use wasmtime::{Engine, Config, Store, component::*};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+use std::time::{Duration, Instant};
+use std::sync::{Arc, atomic::{AtomicU64, AtomicBool, Ordering}};
 
 // Generate WIT bindings from shared plugin-interface (generic library world)
 wasmtime::component::bindgen!({
@@ -33,12 +35,18 @@ struct Plugin {
     store: Store<Host>,
     bindings: Library,
     caps: Option<ProviderCapabilities>,
+    rate_limit: Duration,
+    slow_warn: Duration,
+    call_timeout: Duration,
+    last_call: Option<Instant>,
+    epoch_ticks: Arc<AtomicU64>,
+    epoch_interval: Duration,
     _instance: wasmtime::component::Instance,
     _component: Component,
 }
 
 impl Plugin {
-    pub async fn new(engine: &Engine, plugin_path: &Path) -> Result<Self> {
+    pub async fn new(engine: &Engine, plugin_path: &Path, epoch_ticks: Arc<AtomicU64>, epoch_interval: Duration) -> Result<Self> {
         let component = Component::from_file(engine, plugin_path)?;
 
         // Initialize WASI context for the plugin
@@ -72,34 +80,115 @@ impl Plugin {
             store,
             bindings,
             caps,
+            rate_limit: Duration::from_millis(150),
+            slow_warn: Duration::from_secs(5),
+            call_timeout: Duration::from_secs(15),
+            last_call: None,
+            epoch_ticks,
+            epoch_interval,
             _instance: instance,
             _component: component,
         })
     }
 
+    fn set_deadline(&mut self) {
+        // Convert timeout into epoch ticks
+        let now = self.epoch_ticks.load(Ordering::Relaxed);
+        let per_tick_ms = self.epoch_interval.as_millis().max(1) as u128;
+        let need = ((self.call_timeout.as_millis() + per_tick_ms - 1) / per_tick_ms) as u64;
+        let deadline = now.saturating_add(need);
+        // Safety: using large value to clear deadline after call
+        self.store.set_epoch_deadline(deadline);
+    }
+
+    fn clear_deadline(&mut self) {
+        // Setting a huge deadline effectively clears it
+        self.store.set_epoch_deadline(u64::MAX);
+    }
+
+    fn throttle(&mut self) {
+        if let Some(last) = self.last_call {
+            let elapsed = last.elapsed();
+            if elapsed < self.rate_limit {
+                std::thread::sleep(self.rate_limit - elapsed);
+            }
+        }
+        self.last_call = Some(Instant::now());
+    }
+
+    fn warn_if_slow(&self, start: Instant, op: &str) {
+        let elapsed = start.elapsed();
+        if elapsed > self.slow_warn {
+            eprintln!("Plugin {} {} took {:?}", self.name, op, elapsed);
+        }
+    }
+
+    fn retry_once<T, F>(&mut self, mut f: F, op: &str) -> Result<T>
+    where F: FnMut(&mut Self) -> Result<T> {
+        match f(self) {
+            Ok(v) => Ok(v),
+            Err(e1) => {
+                eprintln!("Plugin {} {} failed: {}. Retrying...", self.name, op, e1);
+                std::thread::sleep(Duration::from_millis(200));
+                f(self).map_err(|e2| anyhow!("{} after retry: {}", op, e2))
+            }
+        }
+    }
+
     // Generic methods
     fn fetch_media_list(&mut self, kind: MediaType, query: &str) -> Result<Vec<Media>> {
-        self.bindings
-            .call_fetchmedialist(&mut self.store, &kind, query)
-            .map_err(|e| anyhow!("Failed to call fetchmedialist: {}", e))
+        self.throttle();
+        self.set_deadline();
+        let start = Instant::now();
+        let res = self.retry_once(|this| {
+            this.bindings
+                .call_fetchmedialist(&mut this.store, &kind, query)
+                .map_err(|e| anyhow!("Failed to call fetchmedialist: {}", e))
+        }, "fetchmedialist");
+        self.clear_deadline();
+        self.warn_if_slow(start, "fetchmedialist");
+        res
     }
 
     fn fetch_units(&mut self, media_id: &str) -> Result<Vec<Unit>> {
-        self.bindings
-            .call_fetchunits(&mut self.store, media_id)
-            .map_err(|e| anyhow!("Failed to call fetchunits: {}", e))
+        self.throttle();
+        self.set_deadline();
+        let start = Instant::now();
+        let res = self.retry_once(|this| {
+            this.bindings
+                .call_fetchunits(&mut this.store, media_id)
+                .map_err(|e| anyhow!("Failed to call fetchunits: {}", e))
+        }, "fetchunits");
+        self.clear_deadline();
+        self.warn_if_slow(start, "fetchunits");
+        res
     }
 
     fn fetch_assets(&mut self, unit_id: &str) -> Result<Vec<Asset>> {
-        self.bindings
-            .call_fetchassets(&mut self.store, unit_id)
-            .map_err(|e| anyhow!("Failed to call fetchassets: {}", e))
+        self.throttle();
+        self.set_deadline();
+        let start = Instant::now();
+        let res = self.retry_once(|this| {
+            this.bindings
+                .call_fetchassets(&mut this.store, unit_id)
+                .map_err(|e| anyhow!("Failed to call fetchassets: {}", e))
+        }, "fetchassets");
+        self.clear_deadline();
+        self.warn_if_slow(start, "fetchassets");
+        res
     }
 
-    fn get_capabilities(&mut self) -> Result<ProviderCapabilities> {
-        self.bindings
+    fn get_capabilities_refresh(&mut self) -> Result<ProviderCapabilities> {
+        let caps = self.bindings
             .call_getcapabilities(&mut self.store)
-            .map_err(|e| anyhow!("Failed to call getcapabilities: {}", e))
+            .map_err(|e| anyhow!("Failed to call getcapabilities: {}", e))?;
+        self.caps = Some(caps.clone());
+        Ok(caps)
+    }
+
+    fn get_capabilities_cached(&mut self) -> Result<ProviderCapabilities> {
+        if let Some(c) = self.caps.clone() { return Ok(c); }
+        self.get_capabilities_refresh()
     }
 
     fn supports_media(&self, target: MediaType) -> bool {
@@ -132,8 +221,12 @@ impl Plugin {
 
 // Simplified plugin manager - generic
 pub struct PluginManager {
-    engine: Engine,
+    engine: Arc<Engine>,
     plugins: Vec<Plugin>,
+    epoch_ticks: Arc<AtomicU64>,
+    epoch_interval: Duration,
+    epoch_stop: Arc<AtomicBool>,
+    epoch_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PluginManager {
@@ -141,12 +234,37 @@ impl PluginManager {
         let mut config = Config::new();
         config.wasm_component_model(true);
         config.async_support(false);
-        let engine = Engine::new(&config)?;
-        Ok(Self { engine, plugins: Vec::new() })
+        config.epoch_interruption(true);
+        let engine = Arc::new(Engine::new(&config)?);
+
+        // Start epoch ticker (10ms)
+        let epoch_interval = Duration::from_millis(10);
+        let epoch_ticks = Arc::new(AtomicU64::new(0));
+        let epoch_stop = Arc::new(AtomicBool::new(false));
+        let eng = engine.clone();
+        let ticks = epoch_ticks.clone();
+        let stop = epoch_stop.clone();
+        let handle = std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(epoch_interval);
+                eng.increment_epoch();
+                ticks.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        Ok(Self { engine, plugins: Vec::new(), epoch_ticks, epoch_interval, epoch_stop, epoch_thread: Some(handle) })
+    }
+
+    pub fn set_rate_limit_millis(&mut self, ms: u64) {
+        for p in &mut self.plugins { p.rate_limit = Duration::from_millis(ms); }
+    }
+
+    pub fn set_call_timeout_millis(&mut self, ms: u64) {
+        for p in &mut self.plugins { p.call_timeout = Duration::from_millis(ms); }
     }
 
     pub async fn load_plugin(&mut self, plugin_path: &Path) -> Result<()> {
-        let plugin = Plugin::new(&self.engine, plugin_path).await?;
+        let plugin = Plugin::new(&self.engine, plugin_path, self.epoch_ticks.clone(), self.epoch_interval).await?;
         self.plugins.push(plugin);
         println!("Loaded plugin: {}", plugin_path.display());
         Ok(())
@@ -171,6 +289,15 @@ impl PluginManager {
 
     pub fn list_plugins(&self) -> Vec<String> {
         self.plugins.iter().map(|p| p.name.clone()).collect()
+    }
+
+    pub fn get_capabilities(&mut self, refresh: bool) -> Result<Vec<(String, ProviderCapabilities)>> {
+        let mut out = Vec::new();
+        for p in &mut self.plugins {
+            let caps = if refresh { p.get_capabilities_refresh()? } else { p.get_capabilities_cached()? };
+            out.push((p.name.clone(), caps));
+        }
+        Ok(out)
     }
 
     // Convenience wrappers for current CLI (manga-focused)

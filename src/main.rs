@@ -45,6 +45,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for plugin_name in agg.list_plugins() { println!("  - {}", plugin_name); }
             }
         }
+        Commands::Capabilities { refresh } => {
+            let caps = agg.get_capabilities(refresh)?;
+            for (name, c) in caps {
+                let media: Vec<String> = c.media_types.into_iter().map(|m| format!("{:?}", m)).collect();
+                let units: Vec<String> = c.unit_kinds.into_iter().map(|u| format!("{:?}", u)).collect();
+                let assets: Vec<String> = c.asset_kinds.into_iter().map(|a| format!("{:?}", a)).collect();
+                println!("{}:\n  media:  {}\n  units:  {}\n  assets: {}", name, media.join(", "), units.join(", "), assets.join(", "));
+            }
+        }
         Commands::Manga { query } => {
             println!("Fetching manga list for query: {}", query);
             if agg.list_plugins().is_empty() { eprintln!("No plugins loaded"); return Ok(()); }

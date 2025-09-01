@@ -222,3 +222,15 @@ pub async fn find_episode_id_by_mapping(pool: &AnyPool, series_id: &str, source_
     .await?;
     Ok(id)
 }
+
+// New: Resolve episode id without requiring series_id (best-effort)
+pub async fn find_episode_id_by_source_external(pool: &AnyPool, source_id: &str, external_id: &str) -> Result<Option<String>> {
+    let id = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM episodes WHERE source_id = ? AND external_id = ? LIMIT 1",
+    )
+    .bind(source_id)
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}

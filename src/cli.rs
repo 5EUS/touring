@@ -26,6 +26,12 @@ pub enum Commands {
         #[arg(short, long)]
         name: Option<String>,
     },
+    /// Show plugin capabilities (cached by default)
+    Capabilities {
+        /// Refresh capabilities by calling each plugin
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Search for manga
     Manga {
         /// Query to search for
