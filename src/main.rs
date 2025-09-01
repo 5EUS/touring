@@ -26,12 +26,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if v == "1" || v == "true" || v == "yes" { cli.no_migrations = true; }
         }
     }
+    if cli.plugins_dir.is_none() {
+        if let Ok(v) = std::env::var("TOURING_PLUGINS_DIR") { if !v.is_empty() { cli.plugins_dir = Some(v); } }
+    }
 
     // Initialize Aggregator synchronously (it owns an internal runtime for DB I/O)
     let mut agg = aggregator::Aggregator::new(cli.database_url.as_deref(), !cli.no_migrations)?;
 
     // Load plugins with the outer runtime
-    rt.block_on(async { agg.load_plugins_from_directory(Path::new("plugins")).await })?;
+    let plugins_dir = cli.plugins_dir.clone().unwrap_or_else(|| "plugins".to_string());
+    rt.block_on(async { agg.load_plugins_from_directory(Path::new(&plugins_dir)).await })?;
 
     match cli.command {
         Commands::Plugins { name } => {
@@ -54,29 +58,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}:\n  media:  {}\n  units:  {}\n  assets: {}", name, media.join(", "), units.join(", "), assets.join(", "));
             }
         }
-        Commands::Manga { query } => {
-            println!("Fetching manga list for query: {}", query);
+        Commands::Manga { query, refresh, json } => {
             if agg.list_plugins().is_empty() { eprintln!("No plugins loaded"); return Ok(()); }
-            match agg.search_manga(&query) {
-                Ok(manga_list) => {
-                    for manga in manga_list {
-                        println!("Manga: {} (ID: {})", manga.title, manga.id);
-                        if let Some(description) = &manga.description { println!("  Description: {}", description); }
-                        if let Some(url) = &manga.url { println!("  URL: {}", url); }
-                        if let Some(cover) = &manga.cover_url { println!("  Cover: {}", cover); }
-                    }
+            if json {
+                let pairs = agg.search_manga_cached_with_sources(&query, refresh)?;
+                println!("{}", serde_json::to_string_pretty(&pairs.iter().map(|(src, m)| {
+                    let mt = match &m.mediatype { crate::plugins::MediaType::Manga => "manga", crate::plugins::MediaType::Anime => "anime", crate::plugins::MediaType::Other(_) => "other" };
+                    serde_json::json!({
+                        "source": src,
+                        "id": m.id,
+                        "title": m.title,
+                        "description": m.description,
+                        "url": m.url,
+                        "cover_url": m.cover_url,
+                        "mediatype": mt,
+                    })
+                }).collect::<Vec<_>>())?);
+            } else {
+                println!("Fetching manga list for query: {}{}", query, if refresh { " (refresh)" } else { "" });
+                let pairs = agg.search_manga_cached_with_sources(&query, refresh)?;
+                for (src, m) in pairs {
+                    println!("Manga [{}]: {} (ID: {})", src, m.title, m.id);
+                    if let Some(description) = &m.description { println!("  Description: {}", description); }
+                    if let Some(url) = &m.url { println!("  URL: {}", url); }
+                    if let Some(cover) = &m.cover_url { println!("  Cover: {}", cover); }
                 }
-                Err(e) => eprintln!("Error fetching manga list: {}", e),
             }
         }
-        Commands::Anime { query } => {
-            println!("Fetching anime list for query: {}", query);
+        Commands::Anime { query, refresh, json } => {
             if agg.list_plugins().is_empty() { eprintln!("No plugins loaded"); return Ok(()); }
-            match agg.search_anime(&query) {
-                Ok(list) => {
-                    for m in list { println!("Anime: {} (ID: {})", m.title, m.id); }
-                }
-                Err(e) => eprintln!("Error fetching anime list: {}", e),
+            if json {
+                let pairs = agg.search_anime_cached_with_sources(&query, refresh)?;
+                println!("{}", serde_json::to_string_pretty(&pairs.iter().map(|(src, m)| {
+                    let mt = match &m.mediatype { crate::plugins::MediaType::Manga => "manga", crate::plugins::MediaType::Anime => "anime", crate::plugins::MediaType::Other(_) => "other" };
+                    serde_json::json!({
+                        "source": src,
+                        "id": m.id,
+                        "title": m.title,
+                        "description": m.description,
+                        "url": m.url,
+                        "cover_url": m.cover_url,
+                        "mediatype": mt,
+                    })
+                }).collect::<Vec<_>>())?);
+            } else {
+                println!("Fetching anime list for query: {}{}", query, if refresh { " (refresh)" } else { "" });
+                let pairs = agg.search_anime_cached_with_sources(&query, refresh)?;
+                for (src, m) in pairs { println!("Anime [{}]: {} (ID: {})", src, m.title, m.id); }
             }
         }
         Commands::Chapters { manga_id } => {
@@ -121,10 +149,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => eprintln!("Error fetching episodes: {}", e),
             }
         }
-        Commands::Chapter { chapter_id } => {
+        Commands::Chapter { chapter_id, refresh } => {
             println!("Fetching chapter images for chapter ID: {}", chapter_id);
             if agg.list_plugins().is_empty() { eprintln!("No plugins loaded"); return Ok(()); }
-            match agg.get_chapter_images(&chapter_id) {
+            match agg.get_chapter_images_with_refresh(&chapter_id, refresh) {
                 Ok(image_urls) => {
                     if image_urls.is_empty() { println!("No images found for chapter ID: {}", chapter_id); }
                     else {

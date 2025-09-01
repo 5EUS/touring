@@ -6,6 +6,7 @@ use crate::plugins::{PluginManager, Media, Unit, UnitKind, MediaType, Asset, Ass
 use crate::storage::Storage;
 use crate::dao;
 use crate::mapping::{series_insert_from_media, series_source_from, chapter_insert_from_unit};
+use serde::{Serialize, Deserialize};
 
 /// Aggregator decouples media aggregation and persistence from the CLI/backend.
 /// It owns the database and the plugin manager and provides a narrow API.
@@ -13,6 +14,58 @@ pub struct Aggregator {
     db: Database,
     pm: PluginManager,
     rt: tokio::runtime::Runtime,
+    // Caching TTLs (seconds)
+    search_ttl_secs: i64,
+    pages_ttl_secs: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct MediaCache {
+    id: String,
+    mediatype: String,
+    title: String,
+    description: Option<String>,
+    url: Option<String>,
+    cover_url: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SearchEntry {
+    source_id: String,
+    media: MediaCache,
+}
+
+fn media_to_cache(m: &Media) -> MediaCache {
+    let mediatype = match &m.mediatype {
+        MediaType::Manga => "manga".to_string(),
+        MediaType::Anime => "anime".to_string(),
+        MediaType::Other(s) => format!("other:{}", s),
+    };
+    MediaCache {
+        id: m.id.clone(),
+        mediatype,
+        title: m.title.clone(),
+        description: m.description.clone(),
+        url: m.url.clone(),
+        cover_url: m.cover_url.clone(),
+    }
+}
+
+fn media_from_cache(mc: MediaCache) -> Media {
+    let mediatype = match mc.mediatype.as_str() {
+        "manga" => MediaType::Manga,
+        "anime" => MediaType::Anime,
+        s if s.starts_with("other:") => MediaType::Other(s[6..].to_string()),
+        _ => MediaType::Other(mc.mediatype.clone()),
+    };
+    Media {
+        id: mc.id,
+        mediatype,
+        title: mc.title,
+        description: mc.description,
+        url: mc.url,
+        cover_url: mc.cover_url,
+    }
 }
 
 impl Aggregator {
@@ -26,7 +79,10 @@ impl Aggregator {
             Ok::<_, anyhow::Error>(db)
         })?;
         let pm = PluginManager::new()?;
-        Ok(Self { db, pm, rt })
+        // TTLs via env with defaults
+        let search_ttl_secs = std::env::var("TOURING_SEARCH_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60 * 60);
+        let pages_ttl_secs = std::env::var("TOURING_PAGES_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(24 * 60 * 60);
+        Ok(Self { db, pm, rt, search_ttl_secs, pages_ttl_secs })
     }
 
     /// Load all plugins from a directory (async). Caller may choose its own runtime.
@@ -78,6 +134,104 @@ impl Aggregator {
             .collect())
     }
 
+    /// Search manga using per-source cache; on miss, query plugin and persist per source.
+    pub fn search_manga_cached_with_sources(&mut self, query: &str, refresh: bool) -> Result<Vec<(String, Media)>> {
+        let norm = Self::norm_query(query);
+        let now = current_epoch();
+        let mut all: Vec<(String, Media)> = Vec::new();
+
+        for source in self.pm.list_plugins() {
+            let key = format!("{}|search|manga|{}", source, norm);
+            let mut hit: Option<Vec<Media>> = None;
+
+            if !refresh {
+                if let Some(payload) = self.rt.block_on(self.db.get_cache(&key, now)).ok().flatten() {
+                    // Prefer new format: Vec<MediaCache>
+                    if let Ok(items) = serde_json::from_str::<Vec<MediaCache>>(&payload) {
+                        let medias: Vec<Media> = items.into_iter().map(media_from_cache).collect();
+                        hit = Some(medias);
+                    } else if let Ok(entries) = serde_json::from_str::<Vec<SearchEntry>>(&payload) {
+                        // Back-compat from previous global cache format
+                        let medias: Vec<Media> = entries.into_iter().map(|e| media_from_cache(e.media)).collect();
+                        hit = Some(medias);
+                    }
+                }
+            }
+
+            let list = if let Some(mut medias) = hit {
+                // Upsert for each media from cache
+                for m in &medias {
+                    let _ = self.upsert_source(&source, "unknown");
+                    let _ = self.get_or_create_series_id(&source, &m.id, m);
+                }
+                medias
+            } else {
+                // Miss -> query this plugin only
+                let results = self.pm.search_manga_for(&source, query)?;
+                for m in &results {
+                    let _ = self.upsert_source(&source, "unknown");
+                    let _ = self.get_or_create_series_id(&source, &m.id, m);
+                }
+                // Write-through per source
+                let payload = serde_json::to_string(&results.iter().map(media_to_cache).collect::<Vec<_>>())?;
+                let _ = self.rt.block_on(self.db.put_cache(&key, &payload, now + self.search_ttl_secs));
+                results
+            };
+
+            for m in list { all.push((source.clone(), m)); }
+        }
+
+        Ok(all)
+    }
+
+    /// Search anime using per-source cache; on miss, query plugin and persist per source.
+    pub fn search_anime_cached_with_sources(&mut self, query: &str, refresh: bool) -> Result<Vec<(String, Media)>> {
+        let norm = Self::norm_query(query);
+        let now = current_epoch();
+        let mut all: Vec<(String, Media)> = Vec::new();
+
+        for source in self.pm.list_plugins() {
+            let key = format!("{}|search|anime|{}", source, norm);
+            let mut hit: Option<Vec<Media>> = None;
+
+            if !refresh {
+                if let Some(payload) = self.rt.block_on(self.db.get_cache(&key, now)).ok().flatten() {
+                    if let Ok(items) = serde_json::from_str::<Vec<MediaCache>>(&payload) {
+                        let mut medias: Vec<Media> = items.into_iter().map(media_from_cache).collect();
+                        for m in &mut medias { m.mediatype = MediaType::Anime; }
+                        hit = Some(medias);
+                    } else if let Ok(entries) = serde_json::from_str::<Vec<SearchEntry>>(&payload) {
+                        let mut medias: Vec<Media> = entries.into_iter().map(|e| media_from_cache(e.media)).collect();
+                        for m in &mut medias { m.mediatype = MediaType::Anime; }
+                        hit = Some(medias);
+                    }
+                }
+            }
+
+            let list = if let Some(mut medias) = hit {
+                for m in &medias {
+                    let _ = self.upsert_source(&source, "unknown");
+                    let _ = self.get_or_create_series_id(&source, &m.id, m);
+                }
+                medias
+            } else {
+                let mut results = self.pm.search_anime_for(&source, query)?;
+                for m in &mut results { m.mediatype = MediaType::Anime; }
+                for m in &results {
+                    let _ = self.upsert_source(&source, "unknown");
+                    let _ = self.get_or_create_series_id(&source, &m.id, m);
+                }
+                let payload = serde_json::to_string(&results.iter().map(media_to_cache).collect::<Vec<_>>())?;
+                let _ = self.rt.block_on(self.db.put_cache(&key, &payload, now + self.search_ttl_secs));
+                results
+            };
+
+            for m in list { all.push((source.clone(), m)); }
+        }
+
+        Ok(all)
+    }
+
     /// Fetch chapters for a manga id. Upserts chapters linked to canonical series id.
     pub fn get_manga_chapters(&mut self, external_manga_id: &str) -> Result<Vec<Unit>> {
         let (source_opt, units) = self.pm.get_manga_chapters_with_source(external_manga_id)?;
@@ -103,29 +257,6 @@ impl Aggregator {
             })?;
         }
         Ok(units)
-    }
-
-    /// Fetch chapter images (URLs) for a chapter id with caching via Storage trait.
-    pub fn get_chapter_images(&mut self, chapter_id: &str) -> Result<Vec<String>> {
-        let key = format!("all|pages|{}", chapter_id);
-        let now = current_epoch();
-
-        // Try cache
-        if let Some(payload) = self.rt.block_on(self.db.get_cache(&key, now)).ok().flatten() {
-            if let Ok(urls) = serde_json::from_str::<Vec<String>>(&payload) {
-                return Ok(urls);
-            }
-        }
-
-        // Miss -> plugins
-        let (_src_opt, urls) = self.pm.get_chapter_images_with_source(chapter_id)?;
-
-        // Write-through with TTL
-        let payload = serde_json::to_string(&urls)?;
-        let expires_at = now + 24 * 60 * 60;
-        let _ = self.rt.block_on(self.db.put_cache(&key, &payload, expires_at));
-
-        Ok(urls)
     }
 
     /// Fetch episode for an anime id. Upserts episodes linked to canonical series id.
@@ -206,6 +337,60 @@ impl Aggregator {
     pub fn upsert_source(&self, id: &str, version: &str) -> Result<()> {
         let pool = self.db.pool().clone();
         self.rt.block_on(async move { dao::upsert_source(&pool, &dao::SourceInsert { id: id.to_string(), version: version.to_string() }).await })
+    }
+
+    fn norm_query(q: &str) -> String {
+        let trimmed = q.trim().to_ascii_lowercase();
+        let mut out = String::with_capacity(trimmed.len());
+        let mut last_space = false;
+        for ch in trimmed.chars() {
+            if ch.is_whitespace() {
+                if !last_space { out.push(' '); last_space = true; }
+            } else { out.push(ch); last_space = false; }
+        }
+        out
+    }
+
+    /// Search manga using cache; on miss, query plugins and persist.
+    pub fn search_manga_cached(&mut self, query: &str, refresh: bool) -> Result<Vec<Media>> {
+        // Use per-source cache; drop source in return value for backward compat
+        let pairs = self.search_manga_cached_with_sources(query, refresh)?;
+        Ok(pairs.into_iter().map(|(_, m)| m).collect())
+    }
+
+    /// Search anime using cache; on miss, query plugins and persist.
+    pub fn search_anime_cached(&mut self, query: &str, refresh: bool) -> Result<Vec<Media>> {
+        let pairs = self.search_anime_cached_with_sources(query, refresh)?;
+        Ok(pairs.into_iter().map(|(_, m)| m).collect())
+    }
+
+    /// Fetch chapter images (URLs) for a chapter id with caching via Storage trait.
+    pub fn get_chapter_images(&mut self, chapter_id: &str) -> Result<Vec<String>> {
+        self.get_chapter_images_with_refresh(chapter_id, false)
+    }
+
+    pub fn get_chapter_images_with_refresh(&mut self, chapter_id: &str, refresh: bool) -> Result<Vec<String>> {
+        let key = format!("all|pages|{}", chapter_id);
+        let now = current_epoch();
+
+        if !refresh {
+            // Try cache
+            if let Some(payload) = self.rt.block_on(self.db.get_cache(&key, now)).ok().flatten() {
+                if let Ok(urls) = serde_json::from_str::<Vec<String>>(&payload) {
+                    return Ok(urls);
+                }
+            }
+        }
+
+        // Miss -> plugins
+        let (_src_opt, urls) = self.pm.get_chapter_images_with_source(chapter_id)?;
+
+        // Write-through with TTL
+        let payload = serde_json::to_string(&urls)?;
+        let expires_at = now + self.pages_ttl_secs;
+        let _ = self.rt.block_on(self.db.put_cache(&key, &payload, expires_at));
+
+        Ok(urls)
     }
 
     /// List capabilities per plugin. If refresh is true, call plugins, else use cached.

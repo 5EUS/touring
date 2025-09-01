@@ -14,6 +14,10 @@ pub struct Cli {
     #[arg(long = "no-migrations", default_value_t = false)]
     pub no_migrations: bool,
 
+    /// Directory to load plugins (.wasm) from. Can also be set via TOURING_PLUGINS_DIR.
+    #[arg(long = "plugins-dir")]
+    pub plugins_dir: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -36,11 +40,23 @@ pub enum Commands {
     Manga {
         /// Query to search for
         query: String,
+        /// Bypass cache and force refresh
+        #[arg(long)]
+        refresh: bool,
+        /// Output JSON for machine readability
+        #[arg(long)]
+        json: bool,
     },
     /// Search for anime
     Anime {
         /// Query to search for
         query: String,
+        /// Bypass cache and force refresh
+        #[arg(long)]
+        refresh: bool,
+        /// Output JSON for machine readability
+        #[arg(long)]
+        json: bool,
     },
     /// Get chapters for a specific manga
     Chapters {
@@ -56,6 +72,9 @@ pub enum Commands {
     Chapter {
         /// Chapter ID to retrieve images for
         chapter_id: String,
+        /// Bypass cache and force refresh
+        #[arg(long)]
+        refresh: bool,
     },
     /// Get video streams for an episode
     Streams {

@@ -61,6 +61,11 @@ impl Plugin {
         };
         let mut store = Store::new(engine, host);
 
+        // Ensure the store starts with a safe far-future epoch deadline to avoid immediate traps
+        let now = epoch_ticks.load(Ordering::Relaxed);
+        let far = now.saturating_add(1_000_000_000);
+        store.set_epoch_deadline(far);
+
         // Create a new linker for this plugin
         let mut linker = Linker::new(engine);
         wasmtime_wasi::add_to_linker_sync(&mut linker)?;
@@ -92,18 +97,19 @@ impl Plugin {
     }
 
     fn set_deadline(&mut self) {
-        // Convert timeout into epoch ticks
+        // Convert timeout into epoch ticks (absolute deadline)
         let now = self.epoch_ticks.load(Ordering::Relaxed);
         let per_tick_ms = self.epoch_interval.as_millis().max(1) as u128;
         let need = ((self.call_timeout.as_millis() + per_tick_ms - 1) / per_tick_ms) as u64;
         let deadline = now.saturating_add(need);
-        // Safety: using large value to clear deadline after call
         self.store.set_epoch_deadline(deadline);
     }
 
     fn clear_deadline(&mut self) {
-        // Setting a huge deadline effectively clears it
-        self.store.set_epoch_deadline(u64::MAX);
+        // Move deadline far into the future without risking overflow
+        let now = self.epoch_ticks.load(Ordering::Relaxed);
+        let far = now.saturating_add(1_000_000_000); // ~10^9 ticks ahead
+        self.store.set_epoch_deadline(far);
     }
 
     fn throttle(&mut self) {
@@ -125,14 +131,21 @@ impl Plugin {
 
     fn retry_once<T, F>(&mut self, mut f: F, op: &str) -> Result<T>
     where F: FnMut(&mut Self) -> Result<T> {
-        match f(self) {
-            Ok(v) => Ok(v),
-            Err(e1) => {
-                eprintln!("Plugin {} {} failed: {}. Retrying...", self.name, op, e1);
-                std::thread::sleep(Duration::from_millis(200));
-                f(self).map_err(|e2| anyhow!("{} after retry: {}", op, e2))
+        for attempt in 0..2 {
+            self.set_deadline();
+            let res = f(self);
+            self.clear_deadline();
+            match res {
+                Ok(v) => return Ok(v),
+                Err(e1) if attempt == 0 => {
+                    eprintln!("Plugin {} {} failed: {}. Retrying...", self.name, op, e1);
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                Err(e) => return Err(anyhow!("{} after retry: {}", op, e)),
             }
         }
+        unreachable!();
     }
 
     // Generic methods
@@ -179,9 +192,13 @@ impl Plugin {
     }
 
     fn get_capabilities_refresh(&mut self) -> Result<ProviderCapabilities> {
+        // Capabilities should also honor deadlines to avoid traps when epoch interruption is enabled
+        self.set_deadline();
         let caps = self.bindings
             .call_getcapabilities(&mut self.store)
-            .map_err(|e| anyhow!("Failed to call getcapabilities: {}", e))?;
+            .map_err(|e| anyhow!("Failed to call getcapabilities: {}", e));
+        self.clear_deadline();
+        let caps = caps?;
         self.caps = Some(caps.clone());
         Ok(caps)
     }
@@ -235,6 +252,7 @@ impl PluginManager {
         config.wasm_component_model(true);
         config.async_support(false);
         config.epoch_interruption(true);
+        // Ensure deterministic fuel/epoch start
         let engine = Arc::new(Engine::new(&config)?);
 
         // Start epoch ticker (10ms)
@@ -245,7 +263,10 @@ impl PluginManager {
         let ticks = epoch_ticks.clone();
         let stop = epoch_stop.clone();
         let handle = std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
+            // Start counter near one to avoid zero math issues
+            ticks.store(1, Ordering::Relaxed);
+            loop {
+                if stop.load(Ordering::Relaxed) { break; }
                 std::thread::sleep(epoch_interval);
                 eng.increment_epoch();
                 ticks.fetch_add(1, Ordering::Relaxed);
@@ -493,5 +514,21 @@ impl PluginManager {
             }
         }
         Ok((None, Vec::new()))
+    }
+
+    pub fn search_manga_for(&mut self, source: &str, query: &str) -> Result<Vec<Media>> {
+        if let Some(p) = self.plugins.iter_mut().find(|p| p.name == source) {
+            if !p.supports_media(MediaType::Manga) { return Ok(Vec::new()); }
+            return p.fetch_media_list(MediaType::Manga, query);
+        }
+        Ok(Vec::new())
+    }
+
+    pub fn search_anime_for(&mut self, source: &str, query: &str) -> Result<Vec<Media>> {
+        if let Some(p) = self.plugins.iter_mut().find(|p| p.name == source) {
+            if !p.supports_media(MediaType::Anime) { return Ok(Vec::new()); }
+            return p.fetch_media_list(MediaType::Anime, query);
+        }
+        Ok(Vec::new())
     }
 }

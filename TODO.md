@@ -1,8 +1,3 @@
-Correctness and stability
-- Capabilities refresh: add a method to refresh/get capabilities at runtime and a CLI command to print them.
-- Timeouts and retries: add per-plugin timeouts, backoff, and error classification; don’t block the whole search.
-- Concurrency: run plugin calls in parallel with a small worker pool; guard with rate limiting.
-
 Data model and persistence
 - Streams: parse quality/label/resolution; store bitrate/resolution; dedupe by (episode_id, url, quality).
 - Subtitles: extend AssetKind and schema for subtitles (lang, format, url).
