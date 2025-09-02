@@ -23,6 +23,8 @@ Desktop.ini
 .idea/
 *.iml
 
+/build
+
 /plugins
 
 /plugin-interface/target
