@@ -231,11 +231,14 @@ impl Touring {
     /// Fetch episode streams for an episode id; persists streams (dedupe by (episode_id, url)).
     pub async fn get_episode_streams(&self, external_episode_id: &str) -> Result<Vec<Asset>> {
         let pm = self.pm.clone();
-        let eid = external_episode_id.to_string();
-        let (src_opt, vids) = tokio::task::spawn_blocking(move || pm.lock().unwrap().get_episode_streams_with_source(&eid)).await.unwrap()?;
+        let eid_input = external_episode_id.to_string();
+        // Resolve canonical -> external if needed
+        let eid = self.resolve_episode_external_id(&eid_input).await?;
+        let eid_for_call = eid.clone();
+        let (src_opt, vids) = tokio::task::spawn_blocking(move || pm.lock().unwrap().get_episode_streams_with_source(&eid_for_call)).await.unwrap()?;
         if let Some(source_id) = src_opt {
             let pool = self.db.pool().clone();
-            if let Some(canonical_eid) = crate::dao::find_episode_id_by_source_external(&pool, &source_id, external_episode_id).await? {
+            if let Some(canonical_eid) = crate::dao::find_episode_id_by_source_external(&pool, &source_id, &eid).await? {
                 let streams: Vec<crate::dao::StreamInsert> = vids.iter().map(|a| crate::dao::StreamInsert {
                     episode_id: canonical_eid.clone(),
                     url: a.url.clone(),
@@ -248,44 +251,52 @@ impl Touring {
         Ok(vids)
     }
 
-    /// Fetch chapter images (URLs) with caching and optional refresh.
+    /// Fetch chapter images (URLs) with caching and optional refresh. Accepts canonical or external chapter id.
     pub async fn get_chapter_images_with_refresh(&self, chapter_id: &str, refresh: bool) -> Result<Vec<String>> {
-        let key = format!("all|pages|{}", chapter_id);
+        // Resolve canonical -> external if possible, but keep original too
+        let original_id = chapter_id.to_string();
+        let external_id = self.resolve_chapter_external_id(chapter_id).await?;
+        let key_orig = format!("all|pages|{}", original_id);
+        let key_ext = format!("all|pages|{}", external_id);
         let now = current_epoch();
 
         if !refresh {
-            if let Some(payload) = self.db.get_cache(&key, now).await.ok().flatten() {
-                if let Ok(urls) = serde_json::from_str::<Vec<String>>(&payload) {
-                    return Ok(urls);
+            // First try cache with the exact id the user provided (back-compat)
+            if let Some(payload) = self.db.get_cache(&key_orig, now).await.ok().flatten() {
+                if let Ok(urls) = serde_json::from_str::<Vec<String>>(&payload) { return Ok(urls); }
+            }
+            // Then try the external-id-based cache key
+            if key_ext != key_orig {
+                if let Some(payload) = self.db.get_cache(&key_ext, now).await.ok().flatten() {
+                    if let Ok(urls) = serde_json::from_str::<Vec<String>>(&payload) { return Ok(urls); }
                 }
             }
         }
 
-        // Miss -> call plugins for this chapter id
-        let pm = self.pm.clone();
-        let cid = chapter_id.to_string();
-        let (_src_opt, urls) = tokio::task::spawn_blocking(move || pm.lock().unwrap().get_chapter_images_with_source(&cid)).await.unwrap()?;
+        // Miss -> call plugins; prefer trying with the ID the user provided first
+        let mut urls: Vec<String> = Vec::new();
+        for try_id in [original_id.as_str(), external_id.as_str()] {
+            let pm = self.pm.clone();
+            let cid = try_id.to_string();
+            let (_src_opt, u) = tokio::task::spawn_blocking(move || pm.lock().unwrap().get_chapter_images_with_source(&cid)).await.unwrap()?;
+            if !u.is_empty() { urls = u; break; }
+            // If first attempt returns empty, try the other id
+            if try_id == external_id.as_str() { break; }
+        }
 
-        // Write-through with TTL
+        // Write-through with TTL into both keys for future hits
         let payload = serde_json::to_string(&urls)?;
         let expires_at = now + self.pages_ttl_secs;
-        let _ = self.db.put_cache(&key, &payload, expires_at).await;
+        let _ = self.db.put_cache(&key_ext, &payload, expires_at).await;
+        if key_orig != key_ext { let _ = self.db.put_cache(&key_orig, &payload, expires_at).await; }
 
         Ok(urls)
     }
 
-    /// Convenience wrapper: fetch chapter images using cache (no refresh).
+    // Convenience: accepts canonical or external chapter id
     pub async fn get_chapter_images(&self, chapter_id: &str) -> Result<Vec<String>> {
         self.get_chapter_images_with_refresh(chapter_id, false).await
     }
-
-    /// Clear cache entries by prefix. Returns number of rows removed.
-    pub async fn clear_cache_prefix(&self, prefix: Option<&str>) -> Result<u64> {
-        self.db.clear_cache_prefix(prefix).await.map_err(Into::into)
-    }
-
-    /// Vacuum/compact the database (SQLite only; no-op on others).
-    pub async fn vacuum_db(&self) -> Result<()> { self.db.vacuum().await.map_err(Into::into) }
 
     // --- Series management APIs ---
 
@@ -329,6 +340,58 @@ impl Touring {
         crate::dao::delete_episode(&pool, episode_id).await
     }
 
+    /// Resolve the canonical series id from a source id and the plugin's external media id
+    pub async fn resolve_series_id(&self, source_id: &str, external_id: &str) -> Result<Option<String>> {
+        let pool = self.db.pool().clone();
+        crate::dao::find_series_id_by_source_external(&pool, source_id, external_id).await
+    }
+
+    /// Get series_id and naming info for a chapter
+    pub async fn get_chapter_meta(&self, chapter_id: &str) -> Result<Option<(String, Option<f64>, Option<String>)>> {
+        let pool = self.db.pool().clone();
+        // Try canonical id first
+        let row: Option<(String, Option<f64>, Option<String>)> = sqlx::query_as(
+            "SELECT series_id, number_num, number_text FROM chapters WHERE id = ?"
+        )
+        .bind(chapter_id)
+        .fetch_optional(&pool)
+        .await?;
+        if row.is_some() { return Ok(row); }
+        // Fallback: treat provided id as external id
+        let row2: Option<(String, Option<f64>, Option<String>)> = sqlx::query_as(
+            "SELECT series_id, number_num, number_text FROM chapters WHERE external_id = ?"
+        )
+        .bind(chapter_id)
+        .fetch_optional(&pool)
+        .await?;
+        Ok(row2)
+    }
+
+    /// Get series_id and naming info for an episode
+    pub async fn get_episode_meta(&self, episode_id: &str) -> Result<Option<(String, Option<f64>, Option<String>)>> {
+        let pool = self.db.pool().clone();
+        let row: Option<(String, Option<f64>, Option<String>)> = sqlx::query_as(
+            "SELECT series_id, number_num, number_text FROM episodes WHERE id = ?"
+        )
+        .bind(episode_id)
+        .fetch_optional(&pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Get stored download path for a series id
+    pub async fn get_series_path(&self, series_id: &str) -> Result<Option<String>> {
+        self.get_series_download_path(series_id).await
+    }
+
+    /// Clear cache entries by prefix. Returns number of rows removed.
+    pub async fn clear_cache_prefix(&self, prefix: Option<&str>) -> Result<u64> {
+        self.db.clear_cache_prefix(prefix).await.map_err(Into::into)
+    }
+
+    /// Vacuum/compact the database (SQLite only; no-op on others).
+    pub async fn vacuum_db(&self) -> Result<()> { self.db.vacuum().await.map_err(Into::into) }
+
     // --- helpers ---
 
     async fn upsert_source(&self, id: &str, version: &str) -> Result<()> {
@@ -347,6 +410,24 @@ impl Touring {
         let link = series_source_from(&new_id, source_id, external_id);
         crate::dao::upsert_series_source(&pool, &link).await?;
         Ok(new_id)
+    }
+
+    async fn resolve_chapter_external_id(&self, id: &str) -> Result<String> {
+        let pool = self.db.pool().clone();
+        let ext: Option<String> = sqlx::query_scalar("SELECT external_id FROM chapters WHERE id = ? LIMIT 1")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await?;
+        Ok(ext.unwrap_or_else(|| id.to_string()))
+    }
+
+    async fn resolve_episode_external_id(&self, id: &str) -> Result<String> {
+        let pool = self.db.pool().clone();
+        let ext: Option<String> = sqlx::query_scalar("SELECT external_id FROM episodes WHERE id = ? LIMIT 1")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await?;
+        Ok(ext.unwrap_or_else(|| id.to_string()))
     }
 }
 

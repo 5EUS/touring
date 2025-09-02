@@ -259,6 +259,15 @@ pub async fn get_series_pref(pool: &AnyPool, series_id: &str) -> Result<Option<S
 }
 
 pub async fn set_series_download_path(pool: &AnyPool, series_id: &str, path: Option<&str>) -> Result<()> {
+    // Ensure the series exists to avoid FK violations and provide a clearer error
+    let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM series WHERE id = ?")
+        .bind(series_id)
+        .fetch_optional(pool)
+        .await?;
+    if exists.is_none() {
+        return Err(anyhow::anyhow!("Series not found: {}", series_id));
+    }
+
     sqlx::query(
         "INSERT INTO series_prefs(series_id, download_path) VALUES(?, ?)\n         ON CONFLICT(series_id) DO UPDATE SET download_path=excluded.download_path, updated_at=CURRENT_TIMESTAMP",
     )
