@@ -137,13 +137,18 @@ impl PluginManager {
 
     pub fn get_capabilities(&mut self, refresh: bool) -> Result<Vec<(String, ProviderCapabilities)>> {
         let mut out = Vec::new();
+        let timeout = Duration::from_secs(10);
         for w in &self.workers {
             let (rtx, rrx) = mpsc::channel();
-            let _ = w.tx.send(PluginCommand::GetCapabilities { refresh, resp: rtx });
-            match rrx.recv() {
+            if let Err(e) = w.tx.send(PluginCommand::GetCapabilities { refresh, resp: rtx }) {
+                eprintln!("Plugin {} send error (get_capabilities): {}", w.name, e);
+                continue;
+            }
+            match rrx.recv_timeout(timeout) {
                 Ok(Ok(caps)) => out.push((w.name.clone(), caps)),
                 Ok(Err(e)) => eprintln!("Plugin {} get_capabilities failed: {}", w.name, e),
-                Err(e) => eprintln!("Plugin {} channel error: {}", w.name, e),
+                Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} get_capabilities timed out after {:?}", w.name, timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (get_capabilities)", w.name),
             }
         }
         Ok(out)
@@ -153,15 +158,20 @@ impl PluginManager {
         let mut pending: Vec<(String, Receiver<anyhow::Result<Vec<Media>>>)> = Vec::new();
         for w in &self.workers {
             let (rtx, rrx) = mpsc::channel();
-            let _ = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Manga, query: query.to_string(), resp: rtx });
+            if let Err(e) = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Manga, query: query.to_string(), resp: rtx }) {
+                eprintln!("Plugin {} send error (search_manga_with_sources): {}", w.name, e);
+                continue;
+            }
             pending.push((w.name.clone(), rrx));
         }
         let mut all = Vec::new();
+        let timeout = Duration::from_secs(20);
         for (name, rrx) in pending {
-            match rrx.recv() {
+            match rrx.recv_timeout(timeout) {
                 Ok(Ok(mut v)) => { for m in v.drain(..) { all.push((name.clone(), m)); } }
                 Ok(Err(e)) => eprintln!("Plugin {} fetchmedialist failed: {}", name, e),
-                Err(e) => eprintln!("Plugin {} channel error: {}", name, e),
+                Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} fetchmedialist timed out after {:?}", name, timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (fetchmedialist)", name),
             }
         }
         Ok(all)
@@ -170,8 +180,16 @@ impl PluginManager {
     pub fn search_manga_for(&mut self, source: &str, query: &str) -> Result<Vec<Media>> {
         if let Some(w) = self.workers.iter().find(|w| w.name == source) {
             let (rtx, rrx) = mpsc::channel();
-            let _ = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Manga, query: query.to_string(), resp: rtx });
-            return rrx.recv().unwrap_or_else(|e| Err(anyhow!("channel error: {}", e)));
+            if let Err(e) = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Manga, query: query.to_string(), resp: rtx }) {
+                return Err(anyhow!("send error: {}", e));
+            }
+            let timeout = Duration::from_secs(20);
+            return match rrx.recv_timeout(timeout) {
+                Ok(Ok(v)) => Ok(v),
+                Ok(Err(e)) => Err(anyhow!("{}", e)),
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!("timeout after {:?}", timeout)),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("channel disconnected")),
+            };
         }
         Ok(Vec::new())
     }
@@ -180,15 +198,20 @@ impl PluginManager {
         let mut pending: Vec<(String, Receiver<anyhow::Result<Vec<Media>>>)> = Vec::new();
         for w in &self.workers {
             let (rtx, rrx) = mpsc::channel();
-            let _ = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Anime, query: query.to_string(), resp: rtx });
+            if let Err(e) = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Anime, query: query.to_string(), resp: rtx }) {
+                eprintln!("Plugin {} send error (search_anime_with_sources): {}", w.name, e);
+                continue;
+            }
             pending.push((w.name.clone(), rrx));
         }
         let mut all = Vec::new();
+        let timeout = Duration::from_secs(20);
         for (name, rrx) in pending {
-            match rrx.recv() {
+            match rrx.recv_timeout(timeout) {
                 Ok(Ok(mut v)) => { for m in v.drain(..) { all.push((name.clone(), m)); } }
                 Ok(Err(e)) => eprintln!("Plugin {} fetchmedialist failed: {}", name, e),
-                Err(e) => eprintln!("Plugin {} channel error: {}", name, e),
+                Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} fetchmedialist timed out after {:?}", name, timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (fetchmedialist)", name),
             }
         }
         Ok(all)
@@ -197,8 +220,16 @@ impl PluginManager {
     pub fn search_anime_for(&mut self, source: &str, query: &str) -> Result<Vec<Media>> {
         if let Some(w) = self.workers.iter().find(|w| w.name == source) {
             let (rtx, rrx) = mpsc::channel();
-            let _ = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Anime, query: query.to_string(), resp: rtx });
-            return rrx.recv().unwrap_or_else(|e| Err(anyhow!("channel error: {}", e)));
+            if let Err(e) = w.tx.send(PluginCommand::FetchMediaList { kind: MediaType::Anime, query: query.to_string(), resp: rtx }) {
+                return Err(anyhow!("send error: {}", e));
+            }
+            let timeout = Duration::from_secs(20);
+            return match rrx.recv_timeout(timeout) {
+                Ok(Ok(v)) => Ok(v),
+                Ok(Err(e)) => Err(anyhow!("{}", e)),
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!("timeout after {:?}", timeout)),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("channel disconnected")),
+            };
         }
         Ok(Vec::new())
     }
@@ -206,14 +237,19 @@ impl PluginManager {
     pub fn get_manga_chapters_with_source(&mut self, manga_id: &str) -> Result<(Option<String>, Vec<Unit>)> {
         for w in &self.workers {
             let (rtx, rrx) = mpsc::channel();
-            let _ = w.tx.send(PluginCommand::FetchUnits { media_id: manga_id.to_string(), resp: rtx });
-            match rrx.recv() {
+            if let Err(e) = w.tx.send(PluginCommand::FetchUnits { media_id: manga_id.to_string(), resp: rtx }) {
+                eprintln!("Plugin {} send error (get_manga_chapters_with_source): {}", w.name, e);
+                continue;
+            }
+            let timeout = Duration::from_secs(20);
+            match rrx.recv_timeout(timeout) {
                 Ok(Ok(units)) => {
                     let chapters: Vec<Unit> = units.into_iter().filter(|u| matches!(u.kind, UnitKind::Chapter)).collect();
                     if !chapters.is_empty() { return Ok((Some(w.name.clone()), chapters)); }
                 }
                 Ok(Err(e)) => eprintln!("Plugin {} fetchunits failed: {}", w.name, e),
-                Err(e) => eprintln!("Plugin {} channel error: {}", w.name, e),
+                Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} fetchunits timed out after {:?}", w.name, timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (fetchunits)", w.name),
             }
         }
         Ok((None, Vec::new()))
@@ -222,14 +258,19 @@ impl PluginManager {
     pub fn get_chapter_images_with_source(&mut self, chapter_id: &str) -> Result<(Option<String>, Vec<String>)> {
         for w in &self.workers {
             let (rtx, rrx) = mpsc::channel();
-            let _ = w.tx.send(PluginCommand::FetchAssets { unit_id: chapter_id.to_string(), resp: rtx });
-            match rrx.recv() {
+            if let Err(e) = w.tx.send(PluginCommand::FetchAssets { unit_id: chapter_id.to_string(), resp: rtx }) {
+                eprintln!("Plugin {} send error (get_chapter_images_with_source): {}", w.name, e);
+                continue;
+            }
+            let timeout = Duration::from_secs(20);
+            match rrx.recv_timeout(timeout) {
                 Ok(Ok(assets)) => {
                     let urls: Vec<String> = assets.into_iter().filter(|a| matches!(a.kind, AssetKind::Page | AssetKind::Image)).map(|a| a.url).collect();
                     if !urls.is_empty() { return Ok((Some(w.name.clone()), urls)); }
                 }
                 Ok(Err(e)) => eprintln!("Plugin {} fetchassets failed: {}", w.name, e),
-                Err(e) => eprintln!("Plugin {} channel error: {}", w.name, e),
+                Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} fetchassets timed out after {:?}", w.name, timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (fetchassets)", w.name),
             }
         }
         Ok((None, Vec::new()))
@@ -238,14 +279,19 @@ impl PluginManager {
     pub fn get_anime_episodes_with_source(&mut self, anime_id: &str) -> Result<(Option<String>, Vec<Unit>)> {
         for w in &self.workers {
             let (rtx, rrx) = mpsc::channel();
-            let _ = w.tx.send(PluginCommand::FetchUnits { media_id: anime_id.to_string(), resp: rtx });
-            match rrx.recv() {
+            if let Err(e) = w.tx.send(PluginCommand::FetchUnits { media_id: anime_id.to_string(), resp: rtx }) {
+                eprintln!("Plugin {} send error (get_anime_episodes_with_source): {}", w.name, e);
+                continue;
+            }
+            let timeout = Duration::from_secs(20);
+            match rrx.recv_timeout(timeout) {
                 Ok(Ok(units)) => {
                     let eps: Vec<Unit> = units.into_iter().filter(|u| matches!(u.kind, UnitKind::Episode)).collect();
                     if !eps.is_empty() { return Ok((Some(w.name.clone()), eps)); }
                 }
                 Ok(Err(e)) => eprintln!("Plugin {} fetchunits failed: {}", w.name, e),
-                Err(e) => eprintln!("Plugin {} channel error: {}", w.name, e),
+                Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} fetchunits timed out after {:?}", w.name, timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (fetchunits)", w.name),
             }
         }
         Ok((None, Vec::new()))
@@ -254,14 +300,19 @@ impl PluginManager {
     pub fn get_episode_streams_with_source(&mut self, episode_id: &str) -> Result<(Option<String>, Vec<Asset>)> {
         for w in &self.workers {
             let (rtx, rrx) = mpsc::channel();
-            let _ = w.tx.send(PluginCommand::FetchAssets { unit_id: episode_id.to_string(), resp: rtx });
-            match rrx.recv() {
+            if let Err(e) = w.tx.send(PluginCommand::FetchAssets { unit_id: episode_id.to_string(), resp: rtx }) {
+                eprintln!("Plugin {} send error (get_episode_streams_with_source): {}", w.name, e);
+                continue;
+            }
+            let timeout = Duration::from_secs(20);
+            match rrx.recv_timeout(timeout) {
                 Ok(Ok(assets)) => {
                     let vids: Vec<Asset> = assets.into_iter().filter(|a| matches!(a.kind, AssetKind::Video)).collect();
                     if !vids.is_empty() { return Ok((Some(w.name.clone()), vids)); }
                 }
                 Ok(Err(e)) => eprintln!("Plugin {} fetchassets failed: {}", w.name, e),
-                Err(e) => eprintln!("Plugin {} channel error: {}", w.name, e),
+                Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} fetchassets timed out after {:?}", w.name, timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (fetchassets)", w.name),
             }
         }
         Ok((None, Vec::new()))

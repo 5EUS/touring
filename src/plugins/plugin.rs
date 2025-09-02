@@ -66,8 +66,8 @@ impl Plugin {
         store.set_epoch_deadline(far);
 
         // Create linker + instance
-        let mut linker = Linker::new(engine);
-        wasmtime_wasi::add_to_linker_sync(&mut linker)?;
+        let mut linker = Linker::<Host>::new(engine);
+        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
         wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker)?;
         let instance = linker.instantiate(&mut store, &component)?;
         let bindings = Library::new(&mut store, &instance)?;
