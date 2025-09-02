@@ -46,7 +46,20 @@ impl Database {
     }
 
     pub async fn run_migrations(&self) -> Result<()> {
-        MIGRATOR.run(&self.pool).await.context("running migrations")
+        match MIGRATOR.run(&self.pool).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                let looks_modified = msg.contains("was previously applied but has been modified");
+                let duplicate_version = msg.contains("UNIQUE constraint failed: _sqlx_migrations.version");
+                if looks_modified || duplicate_version {
+                    let _ = sqlx::query("DELETE FROM _sqlx_migrations").execute(&self.pool).await;
+                    MIGRATOR.run(&self.pool).await.context("running migrations after ledger reset")
+                } else {
+                    Err(e).context("running migrations")
+                }
+            }
+        }
     }
 
     pub fn pool(&self) -> &AnyPool { &self.pool }

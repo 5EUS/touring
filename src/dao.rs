@@ -243,13 +243,19 @@ pub async fn find_episode_id_by_source_external(pool: &AnyPool, source_id: &str,
 
 // New: preferences
 pub async fn get_series_pref(pool: &AnyPool, series_id: &str) -> Result<Option<SeriesPref>> {
-    let row = sqlx::query_as::<_, (String, Option<String>)>(
-        "SELECT series_id, download_path FROM series_prefs WHERE series_id = ?",
+    // Use COALESCE to avoid decoding NULL directly into Option<String> with the Any driver
+    let opt: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT COALESCE(download_path, '') FROM series_prefs WHERE series_id = ?",
     )
     .bind(series_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|(series_id, download_path)| SeriesPref { series_id, download_path }))
+
+    match opt {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(Some(SeriesPref { series_id: series_id.to_string(), download_path: None })),
+        Some(s) => Ok(Some(SeriesPref { series_id: series_id.to_string(), download_path: Some(s) })),
+    }
 }
 
 pub async fn set_series_download_path(pool: &AnyPool, series_id: &str, path: Option<&str>) -> Result<()> {
