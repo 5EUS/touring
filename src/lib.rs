@@ -11,17 +11,103 @@ pub mod types;
 /// Convenience re-exports for embedders.
 pub mod prelude {
     pub use crate::plugins::{Media, Unit, Asset, MediaType, UnitKind, AssetKind, ProviderCapabilities};
+    pub use crate::{SeriesInfo, SeriesMetadataUpdate, SeriesSource, ChapterInfo, EpisodeInfo, DownloadProgress, DownloadResult, LibraryStats};
 }
 
 use anyhow::Result;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
 use crate::plugins::{PluginManager, Media, Unit, MediaType, Asset, ProviderCapabilities};
 use crate::storage::Storage;
 use crate::mapping::{series_insert_from_media, series_source_from, chapter_insert_from_unit};
 use crate::types::{MediaCache, SearchEntry, media_to_cache, media_from_cache};
+
+// --- Data structures for UI API ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeriesInfo {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub cover_url: Option<String>,
+    pub status: Option<String>,
+    pub download_path: Option<String>,
+    pub chapters_count: usize,
+    pub episodes_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeriesMetadataUpdate {
+    pub title: Option<String>,
+    pub description: Option<Option<String>>,
+    pub cover_url: Option<Option<String>>,
+    pub status: Option<Option<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeriesSource {
+    pub source_id: String,
+    pub external_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChapterInfo {
+    pub id: String,
+    pub series_id: String,
+    pub external_id: String,
+    pub number_text: Option<String>,
+    pub number_num: Option<f64>,
+    pub title: Option<String>,
+    pub lang: Option<String>,
+    pub volume: Option<String>,
+    pub has_images: bool,
+    pub image_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpisodeInfo {
+    pub id: String,
+    pub series_id: String,
+    pub external_id: String,
+    pub number_text: Option<String>,
+    pub number_num: Option<f64>,
+    pub title: Option<String>,
+    pub lang: Option<String>,
+    pub season: Option<String>,
+    pub has_streams: bool,
+    pub stream_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadProgress {
+    pub current: usize,
+    pub total: usize,
+    pub current_item: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadResult {
+    pub success: bool,
+    pub items_processed: usize,
+    pub items_downloaded: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryStats {
+    pub total_series: usize,
+    pub manga_series: usize,
+    pub anime_series: usize,
+    pub total_chapters: usize,
+    pub total_episodes: usize,
+    pub total_sources: usize,
+    pub cache_entries: usize,
+    pub expired_cache_entries: usize,
+}
 
 /// Async library entry point. Owns the database and a plugin manager.
 pub struct Touring {
@@ -391,6 +477,464 @@ impl Touring {
 
     /// Vacuum/compact the database (SQLite only; no-op on others).
     pub async fn vacuum_db(&self) -> Result<()> { self.db.vacuum().await.map_err(Into::into) }
+
+    // --- Download API for UI ---
+
+    /// Download chapter images to a directory. Returns number of images downloaded.
+    pub async fn download_chapter_images(&self, chapter_id: &str, output_dir: &Path, force_overwrite: bool) -> Result<usize> {
+        let urls = self.get_chapter_images_with_refresh(chapter_id, false).await?;
+        if urls.is_empty() { return Ok(0); }
+        
+        tokio::fs::create_dir_all(output_dir).await.ok();
+        let client = reqwest::Client::builder().user_agent("touring/0.1").build()?;
+        let mut downloaded = 0;
+        
+        for (i, url) in urls.iter().enumerate() {
+            if url.starts_with("mock://") {
+                let fname = format!("{:04}.jpg", i + 1);
+                let path = output_dir.join(fname);
+                if !force_overwrite && tokio::fs::try_exists(&path).await.unwrap_or(false) { continue; }
+                tokio::fs::write(&path, b"MOCK").await?;
+                downloaded += 1;
+                continue;
+            }
+            
+            let fname = format!("{:04}.jpg", i + 1);
+            let path = output_dir.join(fname);
+            if !force_overwrite && tokio::fs::try_exists(&path).await.unwrap_or(false) { continue; }
+            
+            let resp = client.get(url).send().await?;
+            if !resp.status().is_success() { continue; }
+            let bytes = resp.bytes().await?;
+            tokio::fs::write(&path, &bytes).await?;
+            downloaded += 1;
+        }
+        Ok(downloaded)
+    }
+
+    /// Download chapter as CBZ archive. Returns true if downloaded successfully.
+    pub async fn download_chapter_cbz(&self, chapter_id: &str, output_file: &Path, force_overwrite: bool) -> Result<bool> {
+        if !force_overwrite && tokio::fs::try_exists(output_file).await.unwrap_or(false) { return Ok(false); }
+        
+        let urls = self.get_chapter_images_with_refresh(chapter_id, false).await?;
+        if urls.is_empty() { return Ok(false); }
+        
+        let tmp_dir = output_file.with_extension("tmpdir");
+        let downloaded = self.download_chapter_images(chapter_id, &tmp_dir, true).await?;
+        if downloaded == 0 { return Ok(false); }
+        
+        // Create CBZ
+        let file = std::fs::File::create(output_file)?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        
+        let mut entries: Vec<_> = std::fs::read_dir(&tmp_dir)?.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| e.file_name());
+        
+        for entry in entries {
+            let path = entry.path();
+            if path.is_file() {
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                zip.start_file(name, options)?;
+                let data = std::fs::read(&path)?;
+                use std::io::Write;
+                zip.write_all(&data)?;
+            }
+        }
+        zip.finish()?;
+        
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        Ok(true)
+    }
+
+    /// Download all chapters for a series to a base directory. Returns (chapters_processed, chapters_downloaded).
+    pub async fn download_series_chapters(&self, series_id: &str, base_dir: &Path, as_cbz: bool, force_overwrite: bool) -> Result<(usize, usize)> {
+        let chapters = self.list_chapters_for_series(series_id).await?;
+        let mut processed = 0;
+        let mut downloaded = 0;
+        
+        tokio::fs::create_dir_all(base_dir).await.ok();
+        
+        for (chapter_id, number_num, number_text) in chapters {
+            processed += 1;
+            let name = number_text.or_else(|| number_num.map(|n| format!("{:.3}", n))).unwrap_or_else(|| format!("chapter_{}", processed));
+            
+            if as_cbz {
+                let output_file = base_dir.join(format!("{}.cbz", name));
+                if self.download_chapter_cbz(&chapter_id, &output_file, force_overwrite).await? {
+                    downloaded += 1;
+                }
+            } else {
+                let output_dir = base_dir.join(name);
+                let count = self.download_chapter_images(&chapter_id, &output_dir, force_overwrite).await?;
+                if count > 0 { downloaded += 1; }
+            }
+        }
+        
+        Ok((processed, downloaded))
+    }
+
+    /// Download series with progress callback. Callback receives (current, total, item_name).
+    pub async fn download_series_chapters_with_progress<F>(&self, series_id: &str, base_dir: &Path, as_cbz: bool, force_overwrite: bool, mut progress_callback: F) -> Result<DownloadResult>
+    where
+        F: FnMut(DownloadProgress),
+    {
+        let chapters = self.list_chapters_for_series(series_id).await?;
+        let total = chapters.len();
+        let mut processed = 0;
+        let mut downloaded = 0;
+        
+        tokio::fs::create_dir_all(base_dir).await.ok();
+        
+        for (chapter_id, number_num, number_text) in chapters {
+            processed += 1;
+            let name = number_text.or_else(|| number_num.map(|n| format!("{:.3}", n))).unwrap_or_else(|| format!("chapter_{}", processed));
+            
+            progress_callback(DownloadProgress {
+                current: processed,
+                total,
+                current_item: name.clone(),
+            });
+            
+            let success = if as_cbz {
+                let output_file = base_dir.join(format!("{}.cbz", name));
+                self.download_chapter_cbz(&chapter_id, &output_file, force_overwrite).await.unwrap_or(false)
+            } else {
+                let output_dir = base_dir.join(name);
+                let count = self.download_chapter_images(&chapter_id, &output_dir, force_overwrite).await.unwrap_or(0);
+                count > 0
+            };
+            
+            if success { downloaded += 1; }
+        }
+        
+        Ok(DownloadResult {
+            success: true,
+            items_processed: processed,
+            items_downloaded: downloaded,
+            error: None,
+        })
+    }
+
+    /// Get download status for a series (how many chapters are already downloaded).
+    pub async fn get_series_download_status(&self, series_id: &str, base_dir: &Path, as_cbz: bool) -> Result<(usize, usize)> {
+        let chapters = self.list_chapters_for_series(series_id).await?;
+        let total = chapters.len();
+        let mut downloaded = 0;
+        
+        for (_, number_num, number_text) in chapters.iter().enumerate().map(|(_i, (id, num, text))| (id, num, text)) {
+            let name = number_text.clone().or_else(|| number_num.map(|n| format!("{:.3}", n))).unwrap_or_else(|| format!("chapter_{}", downloaded + 1));
+            
+            let exists = if as_cbz {
+                let output_file = base_dir.join(format!("{}.cbz", name));
+                tokio::fs::try_exists(&output_file).await.unwrap_or(false)
+            } else {
+                let output_dir = base_dir.join(name);
+                tokio::fs::try_exists(&output_dir).await.unwrap_or(false)
+            };
+            
+            if exists { downloaded += 1; }
+        }
+        
+        Ok((downloaded, total))
+    }
+
+    // --- Series Management API for UI ---
+
+    /// Get full series information including metadata and preferences.
+    pub async fn get_series_info(&self, series_id: &str) -> Result<Option<SeriesInfo>> {
+        let pool = self.db.pool().clone();
+        let row: Option<(String, String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, kind, title, description, cover_url, status FROM series WHERE id = ?"
+        )
+        .bind(series_id)
+        .fetch_optional(&pool)
+        .await?;
+        
+        let Some((id, kind, title, description, cover_url, status)) = row else { return Ok(None); };
+        
+        let pref = crate::dao::get_series_pref(&pool, series_id).await?;
+        let download_path = pref.and_then(|p| p.download_path);
+        
+        let chapters_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chapters WHERE series_id = ?")
+            .bind(series_id)
+            .fetch_one(&pool)
+            .await?;
+            
+        let episodes_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE series_id = ?")
+            .bind(series_id)
+            .fetch_one(&pool)
+            .await?;
+        
+        Ok(Some(SeriesInfo {
+            id,
+            kind,
+            title,
+            description,
+            cover_url,
+            status,
+            download_path,
+            chapters_count: chapters_count as usize,
+            episodes_count: episodes_count as usize,
+        }))
+    }
+
+    /// Update series metadata (title, description, status, etc.).
+    pub async fn update_series_metadata(&self, series_id: &str, updates: SeriesMetadataUpdate) -> Result<()> {
+        let pool = self.db.pool().clone();
+        
+        // Build dynamic query based on provided fields
+        let mut query = "UPDATE series SET updated_at = CURRENT_TIMESTAMP".to_string();
+        let mut bindings = Vec::new();
+        
+        if let Some(title) = &updates.title {
+            query.push_str(", title = ?");
+            bindings.push(title.as_str());
+        }
+        if let Some(description) = &updates.description {
+            query.push_str(", description = ?");
+            bindings.push(description.as_deref().unwrap_or(""));
+        }
+        if let Some(cover_url) = &updates.cover_url {
+            query.push_str(", cover_url = ?");
+            bindings.push(cover_url.as_deref().unwrap_or(""));
+        }
+        if let Some(status) = &updates.status {
+            query.push_str(", status = ?");
+            bindings.push(status.as_deref().unwrap_or(""));
+        }
+        
+        query.push_str(" WHERE id = ?");
+        
+        // Execute update if we have any fields to update
+        if !bindings.is_empty() {
+            let mut q = sqlx::query(&query);
+            for binding in bindings {
+                q = q.bind(binding);
+            }
+            q = q.bind(series_id);
+            q.execute(&pool).await?;
+        }
+        
+        Ok(())
+    }
+
+    /// Get all sources and external IDs for a series.
+    pub async fn get_series_sources(&self, series_id: &str) -> Result<Vec<SeriesSource>> {
+        let pool = self.db.pool().clone();
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT source_id, external_id FROM series_sources WHERE series_id = ?"
+        )
+        .bind(series_id)
+        .fetch_all(&pool)
+        .await?;
+        
+        Ok(rows.into_iter().map(|(source_id, external_id)| SeriesSource { source_id, external_id }).collect())
+    }
+
+    /// Add a new source mapping for a series.
+    pub async fn add_series_source(&self, series_id: &str, source_id: &str, external_id: &str) -> Result<()> {
+        let pool = self.db.pool().clone();
+        let link = crate::dao::SeriesSourceInsert {
+            series_id: series_id.to_string(),
+            source_id: source_id.to_string(),
+            external_id: external_id.to_string(),
+        };
+        crate::dao::upsert_series_source(&pool, &link).await
+    }
+
+    /// Remove a source mapping for a series.
+    pub async fn remove_series_source(&self, series_id: &str, source_id: &str, external_id: &str) -> Result<u64> {
+        let pool = self.db.pool().clone();
+        let res = sqlx::query("DELETE FROM series_sources WHERE series_id = ? AND source_id = ? AND external_id = ?")
+            .bind(series_id)
+            .bind(source_id)
+            .bind(external_id)
+            .execute(&pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Get detailed chapter information including download status.
+    pub async fn get_chapter_info(&self, chapter_id: &str) -> Result<Option<ChapterInfo>> {
+        let pool = self.db.pool().clone();
+        let row: Option<(String, String, String, Option<String>, Option<f64>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, series_id, external_id, number_text, number_num, title, lang, volume FROM chapters WHERE id = ?"
+        )
+        .bind(chapter_id)
+        .fetch_optional(&pool)
+        .await?;
+        
+        let Some((id, series_id, external_id, number_text, number_num, title, lang, volume)) = row else { return Ok(None); };
+        
+        // Check if images are cached
+        let images = self.get_chapter_images(chapter_id).await.unwrap_or_default();
+        let has_images = !images.is_empty();
+        
+        Ok(Some(ChapterInfo {
+            id,
+            series_id,
+            external_id,
+            number_text,
+            number_num,
+            title,
+            lang,
+            volume,
+            has_images,
+            image_count: images.len(),
+        }))
+    }
+
+    /// Get detailed episode information.
+    pub async fn get_episode_info(&self, episode_id: &str) -> Result<Option<EpisodeInfo>> {
+        let pool = self.db.pool().clone();
+        let row: Option<(String, String, String, Option<String>, Option<f64>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, series_id, external_id, number_text, number_num, title, lang, season FROM episodes WHERE id = ?"
+        )
+        .bind(episode_id)
+        .fetch_optional(&pool)
+        .await?;
+        
+        let Some((id, series_id, external_id, number_text, number_num, title, lang, season)) = row else { return Ok(None); };
+        
+        // Check for streams
+        let stream_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM streams WHERE episode_id = ?")
+            .bind(episode_id)
+            .fetch_one(&pool)
+            .await?;
+        
+        Ok(Some(EpisodeInfo {
+            id,
+            series_id,
+            external_id,
+            number_text,
+            number_num,
+            title,
+            lang,
+            season,
+            has_streams: stream_count > 0,
+            stream_count: stream_count as usize,
+        }))
+    }
+
+    /// Search series in local database (for UI autocomplete/filtering).
+    pub async fn search_local_series(&self, query: &str, kind: Option<&str>, limit: Option<usize>) -> Result<Vec<SeriesInfo>> {
+        let pool = self.db.pool().clone();
+        let search_term = format!("%{}%", query);
+        let limit_val = limit.unwrap_or(50) as i64;
+        
+        let rows = if let Some(k) = kind {
+            sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, Option<String>)>(
+                "SELECT id, kind, title, description, cover_url, status FROM series WHERE title LIKE ? AND kind = ? ORDER BY title LIMIT ?"
+            )
+            .bind(&search_term)
+            .bind(k)
+            .bind(limit_val)
+            .fetch_all(&pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, (String, String, String, Option<String>, Option<String>, Option<String>)>(
+                "SELECT id, kind, title, description, cover_url, status FROM series WHERE title LIKE ? ORDER BY title LIMIT ?"
+            )
+            .bind(&search_term)
+            .bind(limit_val)
+            .fetch_all(&pool)
+            .await?
+        };
+        
+        let mut result = Vec::new();
+        
+        for (id, kind, title, description, cover_url, status) in rows {
+            let pref = crate::dao::get_series_pref(&pool, &id).await?;
+            let download_path = pref.and_then(|p| p.download_path);
+            
+            let chapters_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chapters WHERE series_id = ?")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await?;
+                
+            let episodes_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM episodes WHERE series_id = ?")
+                .bind(&id)
+                .fetch_one(&pool)
+                .await?;
+            
+            result.push(SeriesInfo {
+                id,
+                kind,
+                title,
+                description,
+                cover_url,
+                status,
+                download_path,
+                chapters_count: chapters_count as usize,
+                episodes_count: episodes_count as usize,
+            });
+        }
+        
+        Ok(result)
+    }
+
+    /// Get statistics about the library (total series, chapters, episodes, etc.).
+    pub async fn get_library_stats(&self) -> Result<LibraryStats> {
+        let pool = self.db.pool().clone();
+        
+        let total_series: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM series").fetch_one(&pool).await?;
+        let manga_series: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM series WHERE kind = 'manga'").fetch_one(&pool).await?;
+        let anime_series: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM series WHERE kind = 'anime'").fetch_one(&pool).await?;
+        let total_chapters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chapters").fetch_one(&pool).await?;
+        let total_episodes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM episodes").fetch_one(&pool).await?;
+        let total_sources: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sources").fetch_one(&pool).await?;
+        
+        // Cache stats
+        let cache_entries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cache").fetch_one(&pool).await?;
+        let expired_cache: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cache WHERE expires_at < ?")
+            .bind(current_epoch())
+            .fetch_one(&pool)
+            .await?;
+        
+        Ok(LibraryStats {
+            total_series: total_series as usize,
+            manga_series: manga_series as usize,
+            anime_series: anime_series as usize,
+            total_chapters: total_chapters as usize,
+            total_episodes: total_episodes as usize,
+            total_sources: total_sources as usize,
+            cache_entries: cache_entries as usize,
+            expired_cache_entries: expired_cache as usize,
+        })
+    }
+
+    /// Refresh metadata for a series from all its sources.
+    pub async fn refresh_series_metadata(&self, series_id: &str) -> Result<bool> {
+        let sources = self.get_series_sources(series_id).await?;
+        let mut updated = false;
+        
+        for source in sources {
+            // Try to fetch fresh metadata for this series from the source
+            let pm = self.pm.clone();
+            let external_id = source.external_id.clone();
+            let source_id = source.source_id.clone();
+            
+            let media_list = tokio::task::spawn_blocking(move || {
+                pm.lock().unwrap().search_manga_for(&source_id, &external_id)
+            }).await.unwrap().unwrap_or_default();
+            
+            // If we find a match, update the series metadata
+            if let Some(media) = media_list.into_iter().find(|m| m.id == source.external_id) {
+                let updates = SeriesMetadataUpdate {
+                    title: Some(media.title),
+                    description: Some(media.description),
+                    cover_url: Some(media.cover_url),
+                    status: None, // Don't override status from search results
+                };
+                self.update_series_metadata(series_id, updates).await?;
+                updated = true;
+            }
+        }
+        
+        Ok(updated)
+    }
 
     // --- helpers ---
 

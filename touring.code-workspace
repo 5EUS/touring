@@ -11,6 +11,9 @@
 		},
 		{
 			"path": "../test_plugin"
+		},
+		{
+			"path": "../touring_ui"
 		}
 	],
 	"settings": {}
