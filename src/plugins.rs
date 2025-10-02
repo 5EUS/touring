@@ -30,6 +30,7 @@ enum PluginCommand {
 struct PluginWorker {
     name: String,
     tx: Sender<PluginCommand>,
+    call_timeout: Duration,
 }
 
 // Simplified plugin manager - generic
@@ -93,7 +94,9 @@ impl PluginManager {
             let _ = ptx.send(res);
         });
         let plugin = prx.recv().map_err(|e| anyhow!("plugin instantiate thread join error: {}", e))??;
-        let name = plugin.name.clone();
+    let name = plugin.name.clone();
+    // Capture per-plugin timeout before moving plugin into thread
+    let call_timeout = plugin.call_timeout;
         let (tx, rx): (Sender<PluginCommand>, Receiver<PluginCommand>) = mpsc::channel();
 
         std::thread::spawn(move || {
@@ -125,7 +128,7 @@ impl PluginManager {
             }
         });
 
-        self.workers.push(PluginWorker { name: name.clone(), tx });
+        self.workers.push(PluginWorker { name: name.clone(), tx, call_timeout });
         println!("Loaded plugin: {}", plugin_path.display());
         Ok(())
     }
@@ -160,8 +163,8 @@ impl PluginManager {
 
     pub fn get_capabilities(&mut self, refresh: bool) -> Result<Vec<(String, ProviderCapabilities)>> {
         let mut out = Vec::new();
-        let timeout = Duration::from_secs(10);
         for w in &self.workers {
+            let timeout = w.call_timeout;
             let (rtx, rrx) = mpsc::channel();
             if let Err(e) = w.tx.send(PluginCommand::GetCapabilities { refresh, resp: rtx }) {
                 warn!(plugin=%w.name, error=%e, "send error get_capabilities");
@@ -179,8 +182,8 @@ impl PluginManager {
 
     pub fn get_allowed_hosts(&mut self) -> Result<Vec<(String, Vec<String>)>> {
         let mut out = Vec::new();
-        let timeout = Duration::from_secs(10);
         for w in &self.workers {
+            let timeout = w.call_timeout;
             let (rtx, rrx) = mpsc::channel();
             if let Err(e) = w.tx.send(PluginCommand::GetAllowedHosts { resp: rtx }) {
                 warn!(plugin=%w.name, error=%e, "send error get_allowed_hosts");
@@ -214,7 +217,7 @@ impl PluginManager {
 
     // Generic internal helpers ------------------------------------------------------
     fn search_with_sources(&mut self, kind: MediaType, query: &str) -> Result<Vec<(String, Media)>> {
-        let mut pending: Vec<(String, Receiver<anyhow::Result<Vec<Media>>>)> = Vec::new();
+        let mut pending: Vec<(String, Receiver<anyhow::Result<Vec<Media>>>, Duration)> = Vec::new();
         for w in &self.workers {
             let (rtx, rrx) = mpsc::channel();
             if let Err(e) = w.tx.send(PluginCommand::FetchMediaList { kind: kind.clone(), query: query.to_string(), resp: rtx }) {
@@ -222,11 +225,10 @@ impl PluginManager {
                 continue;
             }
             debug!(plugin=%w.name, kind=?kind, query, "dispatched search");
-            pending.push((w.name.clone(), rrx));
+            pending.push((w.name.clone(), rrx, w.call_timeout));
         }
-        let timeout = Duration::from_secs(20);
         let mut all = Vec::new();
-        for (name, rrx) in pending {
+        for (name, rrx, timeout) in pending {
             match rrx.recv_timeout(timeout) {
                 Ok(Ok(mut v)) => {
                     let count = v.len();
@@ -247,7 +249,7 @@ impl PluginManager {
             if let Err(e) = w.tx.send(PluginCommand::FetchMediaList { kind: kind.clone(), query: query.to_string(), resp: rtx }) {
                 return Err(anyhow!("send error: {}", e));
             }
-            let timeout = Duration::from_secs(20);
+            let timeout = w.call_timeout;
             return match rrx.recv_timeout(timeout) {
                 Ok(Ok(v)) => {
                     debug!(plugin=%source, kind=?kind, query, count=v.len(), "search_for results");
@@ -267,7 +269,7 @@ impl PluginManager {
                 warn!(plugin=%w.name, error=%e, "send error get_manga_chapters_with_source");
                 continue;
             }
-            let timeout = Duration::from_secs(20);
+            let timeout = w.call_timeout;
             match rrx.recv_timeout(timeout) {
                 Ok(Ok(units)) => {
                     let chapters: Vec<Unit> = units.into_iter().filter(|u| matches!(u.kind, UnitKind::Chapter)).collect();
@@ -288,7 +290,7 @@ impl PluginManager {
                 warn!(plugin=%w.name, error=%e, "send error get_chapter_images_with_source");
                 continue;
             }
-            let timeout = Duration::from_secs(20);
+            let timeout = w.call_timeout;
             match rrx.recv_timeout(timeout) {
                 Ok(Ok(assets)) => {
                     let urls: Vec<String> = assets.into_iter().filter(|a| matches!(a.kind, AssetKind::Page | AssetKind::Image)).map(|a| a.url).collect();
@@ -309,7 +311,7 @@ impl PluginManager {
                 warn!(plugin=%w.name, error=%e, "send error get_anime_episodes_with_source");
                 continue;
             }
-            let timeout = Duration::from_secs(20);
+            let timeout = w.call_timeout;
             match rrx.recv_timeout(timeout) {
                 Ok(Ok(units)) => {
                     let eps: Vec<Unit> = units.into_iter().filter(|u| matches!(u.kind, UnitKind::Episode)).collect();
@@ -330,7 +332,7 @@ impl PluginManager {
                 warn!(plugin=%w.name, error=%e, "send error get_episode_streams_with_source");
                 continue;
             }
-            let timeout = Duration::from_secs(20);
+            let timeout = w.call_timeout;
             match rrx.recv_timeout(timeout) {
                 Ok(Ok(assets)) => {
                     let vids: Vec<Asset> = assets.into_iter().filter(|a| matches!(a.kind, AssetKind::Video)).collect();
