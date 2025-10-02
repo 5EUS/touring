@@ -1,5 +1,6 @@
 pub mod db;
 pub mod plugins;
+pub mod aggregator;
 pub mod storage;
 pub mod dao;
 pub mod mapping;
@@ -15,7 +16,6 @@ pub mod prelude {
 
 use anyhow::Result;
 use std::path::Path;
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 
