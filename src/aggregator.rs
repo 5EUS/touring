@@ -36,9 +36,9 @@ impl Aggregator {
         Ok(Self { db, pm, rt, search_ttl_secs, pages_ttl_secs })
     }
 
-    /// Load all plugins from a directory (async). Caller may choose its own runtime.
-    pub async fn load_plugins_from_directory(&mut self, dir: &Path) -> Result<()> {
-        self.pm.load_plugins_from_directory(dir).await
+    /// Load all plugins from a directory.
+    pub fn load_plugins_from_directory(&mut self, dir: &Path) -> Result<()> {
+        self.pm.load_plugins_from_directory(dir)
     }
 
     /// List loaded plugins.

@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use std::fs;
 use std::path::Path;
 use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
 use std::time::{Duration, Instant};
@@ -7,15 +6,20 @@ use url::Url;
 use wasmtime::{component::*, Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi_http;
+use tracing::{debug, warn, error};
 
 use crate::plugins::*; // bindgen types (Media, Unit, Asset, MediaType, UnitKind, AssetKind, ProviderCapabilities)
 use crate::plugins::host::Host;
 use crate::plugins::config::PluginConfig;
+use tokio::runtime::Runtime;
+use std::sync::Arc as StdArc;
 
+#[allow(dead_code)] // Some fields retained for future lifecycle / metrics usage
 pub(crate) struct Plugin {
     pub(crate) name: String,
     pub(crate) store: Store<Host>,
-    pub(crate) bindings: Library,
+    // Keep bindings alive in case future generated code relies on Drop; underscore silences unused warning.
+    pub(crate) _bindings: Library,
     pub(crate) caps: Option<ProviderCapabilities>,
     pub(crate) rate_limit: Duration,
     pub(crate) slow_warn: Duration,
@@ -26,74 +30,42 @@ pub(crate) struct Plugin {
     pub(crate) allowed_hosts: Option<Vec<String>>,
     pub(crate) _instance: wasmtime::component::Instance,
     pub(crate) _component: Component,
+    rt: StdArc<Runtime>,
 }
 
 impl Plugin {
-    pub fn new(engine: &Engine, plugin_path: &Path, epoch_ticks: Arc<AtomicU64>, epoch_interval: Duration) -> Result<Self> {
+    pub async fn new_async(engine: &Engine, plugin_path: &Path, epoch_ticks: Arc<AtomicU64>, epoch_interval: Duration, rt: StdArc<Runtime>) -> Result<Self> {
         let component = Component::from_file(engine, plugin_path)?;
-
-        // Load plugin config (<name>.toml next to wasm)
         let cfg_path = plugin_path.with_extension("toml");
-        let cfg: PluginConfig = fs::read_to_string(&cfg_path)
+        let cfg: PluginConfig = std::fs::read_to_string(&cfg_path)
             .ok()
             .and_then(|s| toml::from_str(&s).ok())
             .unwrap_or_default();
         let allowed_hosts: Option<Vec<String>> = cfg.allowed_hosts.as_ref().map(|v|
             v.iter().map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()
         );
-
-        // Initialize WASI context for the plugin
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdout().inherit_stderr().inherit_env();
-        if let Some(list) = &allowed_hosts {
-            builder.env("TOURING_ALLOWED_HOSTS", list.join(","));
-        }
+        if let Some(list) = &allowed_hosts { builder.env("TOURING_ALLOWED_HOSTS", list.join(",")); }
         let wasi = builder.build();
-
-        // Build HTTP context
-        let http = wasmtime_wasi_http::WasiHttpCtx::new();
-
-        let host = Host { 
-            wasi,
-            table: wasmtime_wasi::ResourceTable::new(),
-            http,
-        };
+    let http = wasmtime_wasi_http::WasiHttpCtx::new();
+    let host = Host { wasi, table: wasmtime_wasi::ResourceTable::new(), http };
         let mut store = Store::new(engine, host);
-
-        // Safe far-future deadline
         let now = epoch_ticks.load(Ordering::Relaxed);
         let far = now.saturating_add(1_000_000_000);
         store.set_epoch_deadline(far);
-
-        // Create linker + instance
         let mut linker = Linker::<Host>::new(engine);
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
-        wasmtime_wasi_http::add_only_http_to_linker_sync(&mut linker)?;
-        let instance = linker.instantiate(&mut store, &component)?;
-        let bindings = Library::new(&mut store, &instance)?;
-
-        // Prefetch capabilities
-        let caps = match bindings.call_getcapabilities(&mut store) {
-            Ok(c) => Some(c),
-            Err(e) => { eprintln!("Failed to get capabilities for {}: {}", plugin_path.display(), e); None }
-        };
-
-        Ok(Self {
-            name: plugin_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string(),
-            store,
-            bindings,
-            caps,
-            rate_limit: Duration::from_millis(cfg.rate_limit_ms.unwrap_or(150)),
-            slow_warn: Duration::from_secs(5),
-            call_timeout: Duration::from_millis(cfg.call_timeout_ms.unwrap_or(15_000)),
-            last_call: None,
-            epoch_ticks,
-            epoch_interval,
-            allowed_hosts,
-            _instance: instance,
-            _component: component,
-        })
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
+    wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+    // (If sockets support was required explicitly it would be added here; current API couples http to sockets internally when NetworkCtx present.)
+    let instance = linker.instantiate_async(&mut store, &component).await?;
+    let bindings = Library::new(&mut store, &instance)?;
+        // Defer initial getcapabilities call until explicitly requested to avoid synchronous call on async-enabled engine
+        let caps = None;
+    // Use a multi-thread runtime so async HTTP tasks can execute even after moving the Plugin to a different thread.
+        Ok(Self { name: plugin_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string(), store, _bindings: bindings, caps, rate_limit: Duration::from_millis(cfg.rate_limit_ms.unwrap_or(150)), slow_warn: Duration::from_secs(5), call_timeout: Duration::from_millis(cfg.call_timeout_ms.unwrap_or(15_000)), last_call: None, epoch_ticks, epoch_interval, allowed_hosts, _instance: instance, _component: component, rt })
     }
+    // Removed legacy synchronous constructor; async instantiation `new_async` is the only path now.
 
     pub(crate) fn set_deadline(&mut self) {
         let now = self.epoch_ticks.load(Ordering::Relaxed);
@@ -122,7 +94,7 @@ impl Plugin {
     pub(crate) fn warn_if_slow(&self, start: Instant, op: &str) {
         let elapsed = start.elapsed();
         if elapsed > self.slow_warn {
-            eprintln!("Plugin {} {} took {:?}", self.name, op, elapsed);
+            warn!(plugin=%self.name, op, ?elapsed, "plugin operation slow");
         }
     }
 
@@ -135,7 +107,7 @@ impl Plugin {
             match res {
                 Ok(v) => return Ok(v),
                 Err(e1) if attempt == 0 => {
-                    eprintln!("Plugin {} {} failed: {}. Retrying...", self.name, op, e1);
+                    warn!(plugin=%self.name, op, error=%e1, "plugin op failed - retrying");
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
@@ -169,24 +141,37 @@ impl Plugin {
         self.throttle();
         self.set_deadline();
         let start = Instant::now();
+    debug!(plugin=%self.name, ?kind, query, "fetch_media_list start");
         let res = self.retry_once(|this| {
-            this.bindings
-                .call_fetchmedialist(&mut this.store, &kind, query)
-                .map_err(|e| anyhow!("Failed to call fetchmedialist: {}", e))
+            // Try plain export name first, then prefixed variant
+            let func = this._instance.get_func(&mut this.store, "fetchmedialist")
+                .or_else(|| this._instance.get_func(&mut this.store, "library#fetchmedialist"))
+                .ok_or_else(|| anyhow!("missing export fetchmedialist (tried 'fetchmedialist' and 'library#fetchmedialist')"))?;
+            let typed = func.typed::<(MediaType, String), (Vec<Media>,)>(&this.store)?;
+            let (result_vec,) = this.rt.block_on(typed.call_async(&mut this.store, (kind.clone(), query.to_string())))
+                .map_err(|e| anyhow!("Failed to call fetchmedialist async: {}", e))?;
+            Ok(result_vec)
         }, "fetchmedialist");
         self.clear_deadline();
         self.warn_if_slow(start, "fetchmedialist");
         let mut list = match res {
             Ok(v) => {
-                // Filter out sentinel error entries produced by some guests
-                let filtered: Vec<Media> = v.into_iter().filter(|m| m.id != "error" && !m.title.starts_with("HTTP Error:")).collect();
+                // Inspect and log sentinel error entries before filtering them out
+                let mut filtered: Vec<Media> = Vec::with_capacity(v.len());
+                let mut suppressed = 0usize;
+                for m in v.into_iter() {
+                    if m.id == "error" || m.title.starts_with("HTTP Error:") { suppressed += 1; continue; }
+                    filtered.push(m);
+                }
+                if suppressed > 0 { debug!(plugin=%self.name, query, suppressed, "suppressed sentinel error entries"); }
                 filtered
             }
             Err(e) => {
-                eprintln!("Plugin {} fetchmedialist failed: {}", self.name, e);
+                error!(plugin=%self.name, error=%e, "fetchmedialist failed");
                 Vec::new()
             }
         };
+        debug!(plugin=%self.name, query, count=list.len(), "fetch_media_list done");
         for m in &mut list {
             if let Some(u) = &m.url { if !self.url_allowed(u) { m.url = None; } }
             if let Some(c) = &m.cover_url { if !self.url_allowed(c) { m.cover_url = None; } }
@@ -200,16 +185,20 @@ impl Plugin {
         self.set_deadline();
         let start = Instant::now();
         let res = self.retry_once(|this| {
-            this.bindings
-                .call_fetchunits(&mut this.store, media_id)
-                .map_err(|e| anyhow!("Failed to call fetchunits: {}", e))
+            let func = this._instance.get_func(&mut this.store, "fetchunits")
+                .or_else(|| this._instance.get_func(&mut this.store, "library#fetchunits"))
+                .ok_or_else(|| anyhow!("missing export fetchunits (tried 'fetchunits' and 'library#fetchunits')"))?;
+            let typed = func.typed::<(String,), (Vec<Unit>,)>(&this.store)?;
+            let (result_vec,) = this.rt.block_on(typed.call_async(&mut this.store, (media_id.to_string(),)))
+                .map_err(|e| anyhow!("Failed to call fetchunits async: {}", e))?;
+            Ok(result_vec)
         }, "fetchunits");
         self.clear_deadline();
         self.warn_if_slow(start, "fetchunits");
         let mut units = match res {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("Plugin {} fetchunits failed: {}", self.name, e);
+                error!(plugin=%self.name, error=%e, "fetchunits failed");
                 Vec::new()
             }
         };
@@ -223,16 +212,20 @@ impl Plugin {
         self.set_deadline();
         let start = Instant::now();
         let res = self.retry_once(|this| {
-            this.bindings
-                .call_fetchassets(&mut this.store, unit_id)
-                .map_err(|e| anyhow!("Failed to call fetchassets: {}", e))
+            let func = this._instance.get_func(&mut this.store, "fetchassets")
+                .or_else(|| this._instance.get_func(&mut this.store, "library#fetchassets"))
+                .ok_or_else(|| anyhow!("missing export fetchassets (tried 'fetchassets' and 'library#fetchassets')"))?;
+            let typed = func.typed::<(String,), (Vec<Asset>,)>(&this.store)?;
+            let (result_vec,) = this.rt.block_on(typed.call_async(&mut this.store, (unit_id.to_string(),)))
+                .map_err(|e| anyhow!("Failed to call fetchassets async: {}", e))?;
+            Ok(result_vec)
         }, "fetchassets");
         self.clear_deadline();
         self.warn_if_slow(start, "fetchassets");
         let assets = match res {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("Plugin {} fetchassets failed: {}", self.name, e);
+                error!(plugin=%self.name, error=%e, "fetchassets failed");
                 Vec::new()
             }
         };
@@ -245,20 +238,18 @@ impl Plugin {
         self.set_deadline();
         let start = Instant::now();
         let res = self.retry_once(|this| {
-            this.bindings
-                .call_getcapabilities(&mut this.store)
-                .map_err(|e| anyhow!("Failed to call getcapabilities: {}", e))
+            let func = this._instance.get_func(&mut this.store, "getcapabilities")
+                .or_else(|| this._instance.get_func(&mut this.store, "library#getcapabilities"))
+                .ok_or_else(|| anyhow!("missing export getcapabilities (tried 'getcapabilities' and 'library#getcapabilities')"))?;
+            let typed = func.typed::<(), (ProviderCapabilities,)>(&this.store)?;
+            let (caps,) = this.rt.block_on(typed.call_async(&mut this.store, ()))
+                .map_err(|e| anyhow!("Failed to call getcapabilities async: {}", e))?;
+            Ok(caps)
         }, "getcapabilities");
         self.clear_deadline();
         self.warn_if_slow(start, "getcapabilities");
-        match res {
-            Ok(c) => {
-                // Store for next time
-                self.caps = Some(c.clone());
-                Ok(c)
-            }
-            Err(e) => Err(e),
-        }
+        if let Ok(c) = &res { self.caps = Some(c.clone()); }
+        res
     }
 
     pub(crate) fn get_capabilities_cached(&mut self) -> Result<ProviderCapabilities> {
@@ -266,3 +257,4 @@ impl Plugin {
         self.get_capabilities_refresh()
     }
 }
+

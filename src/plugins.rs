@@ -24,7 +24,6 @@ enum PluginCommand {
     FetchAssets { unit_id: String, resp: Sender<anyhow::Result<Vec<Asset>>> },
     GetCapabilities { refresh: bool, resp: Sender<anyhow::Result<ProviderCapabilities>> },
     GetAllowedHosts { resp: Sender<anyhow::Result<Vec<String>>> },
-    Shutdown,
 }
 
 struct PluginWorker {
@@ -33,20 +32,22 @@ struct PluginWorker {
 }
 
 // Simplified plugin manager - generic
+#[allow(dead_code)] // Some fields (_epoch_stop/_epoch_thread) reserved for future coordinated shutdown
 pub struct PluginManager {
     engine: Arc<Engine>,
     workers: Vec<PluginWorker>,
     epoch_ticks: Arc<AtomicU64>,
     epoch_interval: Duration,
-    epoch_stop: Arc<AtomicBool>,
-    epoch_thread: Option<std::thread::JoinHandle<()>>,
+    _epoch_stop: Arc<AtomicBool>,
+    _epoch_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PluginManager {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
-        config.wasm_component_model(true);
-        config.async_support(false);
+    config.wasm_component_model(true);
+    // Enable async support for wasi-http operations
+    config.async_support(true);
         config.epoch_interruption(true);
         
         config.strategy(wasmtime::Strategy::Cranelift);
@@ -69,26 +70,33 @@ impl PluginManager {
             }
         });
 
-        Ok(Self { engine, workers: Vec::new(), epoch_ticks, epoch_interval, epoch_stop, epoch_thread: Some(handle) })
+        Ok(Self { engine, workers: Vec::new(), epoch_ticks, epoch_interval, _epoch_stop: epoch_stop, _epoch_thread: Some(handle) })
     }
 
-    pub async fn load_plugin(&mut self, plugin_path: &Path) -> Result<()> {
+    pub fn load_plugin(&mut self, plugin_path: &Path) -> Result<()> {
         let path = plugin_path.to_path_buf();
+        eprintln!("[debug] instantiating plugin (async): {}", path.display());
+        // Always perform async instantiation on a dedicated thread with its own runtime to avoid nested block_on panics.
+        let (ptx, prx) = mpsc::channel();
         let engine = self.engine.clone();
         let epoch_ticks = self.epoch_ticks.clone();
-        let epoch_interval = self.epoch_interval;
-
+        let interval = self.epoch_interval;
+        // Shared runtime for plugin async calls kept alive for plugin lifetime
+        let shared_rt = std::sync::Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().build()?);
+        let shared_rt_clone = shared_rt.clone();
+        std::thread::spawn(move || {
+            let res = (|| -> Result<Plugin> {
+                let plugin = shared_rt_clone.block_on(Plugin::new_async(&engine, &path, epoch_ticks, interval, shared_rt_clone.clone()))?;
+                Ok(plugin)
+            })();
+            let _ = ptx.send(res);
+        });
+        let plugin = prx.recv().map_err(|e| anyhow!("plugin instantiate thread join error: {}", e))??;
+        let name = plugin.name.clone();
         let (tx, rx): (Sender<PluginCommand>, Receiver<PluginCommand>) = mpsc::channel();
-        let name = plugin_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string();
 
         std::thread::spawn(move || {
-            let mut plugin = match Plugin::new(&engine, &path, epoch_ticks, epoch_interval) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("Failed to initialize plugin {}: {}", path.display(), e);
-                    return;
-                }
-            };
+            let mut plugin = plugin; // move into thread
             loop {
                 match rx.recv() {
                     Ok(PluginCommand::FetchMediaList { kind, query, resp }) => {
@@ -111,7 +119,7 @@ impl PluginManager {
                         let hosts = plugin.allowed_hosts.clone().unwrap_or_default();
                         let _ = resp.send(Ok(hosts));
                     }
-                    Ok(PluginCommand::Shutdown) | Err(_) => break,
+                    Err(_) => break,
                 }
             }
         });
@@ -121,7 +129,7 @@ impl PluginManager {
         Ok(())
     }
 
-    pub async fn load_plugins_from_directory(&mut self, dir: &Path) -> Result<()> {
+    pub fn load_plugins_from_directory(&mut self, dir: &Path) -> Result<()> {
         if !dir.exists() {
             println!("Plugin directory does not exist: {}", dir.display());
             return Ok(());
@@ -137,7 +145,7 @@ impl PluginManager {
                     continue;
                 }
                 
-                if let Err(e) = self.load_plugin(&path).await {
+                if let Err(e) = self.load_plugin(&path) {
                     eprintln!("Failed to load plugin {}: {}", path.display(), e);
                 }
             }
@@ -195,13 +203,22 @@ impl PluginManager {
                 eprintln!("Plugin {} send error (search_manga_with_sources): {}", w.name, e);
                 continue;
             }
+            eprintln!("[debug] dispatched manga search to plugin '{}' (query='{}')", w.name, query);
             pending.push((w.name.clone(), rrx));
         }
         let mut all = Vec::new();
         let timeout = Duration::from_secs(20);
         for (name, rrx) in pending {
             match rrx.recv_timeout(timeout) {
-                Ok(Ok(mut v)) => { for m in v.drain(..) { all.push((name.clone(), m)); } }
+                Ok(Ok(mut v)) => {
+                    let count = v.len();
+                    if count == 0 {
+                        eprintln!("[debug] plugin '{}' returned 0 manga results for query '{}'", name, query);
+                    } else {
+                        eprintln!("[debug] plugin '{}' returned {} manga results for query '{}'", name, count, query);
+                    }
+                    for m in v.drain(..) { all.push((name.clone(), m)); }
+                }
                 Ok(Err(e)) => eprintln!("Plugin {} fetchmedialist failed: {}", name, e),
                 Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} fetchmedialist timed out after {:?}", name, timeout),
                 Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (fetchmedialist)", name),
@@ -218,7 +235,10 @@ impl PluginManager {
             }
             let timeout = Duration::from_secs(20);
             return match rrx.recv_timeout(timeout) {
-                Ok(Ok(v)) => Ok(v),
+                Ok(Ok(v)) => {
+                    eprintln!("[debug] search_manga_for source='{}' query='{}' -> {} results", source, query, v.len());
+                    Ok(v)
+                },
                 Ok(Err(e)) => Err(anyhow!("{}", e)),
                 Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!("timeout after {:?}", timeout)),
                 Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("channel disconnected")),
@@ -235,13 +255,22 @@ impl PluginManager {
                 eprintln!("Plugin {} send error (search_anime_with_sources): {}", w.name, e);
                 continue;
             }
+            eprintln!("[debug] dispatched anime search to plugin '{}' (query='{}')", w.name, query);
             pending.push((w.name.clone(), rrx));
         }
         let mut all = Vec::new();
         let timeout = Duration::from_secs(20);
         for (name, rrx) in pending {
             match rrx.recv_timeout(timeout) {
-                Ok(Ok(mut v)) => { for m in v.drain(..) { all.push((name.clone(), m)); } }
+                Ok(Ok(mut v)) => {
+                    let count = v.len();
+                    if count == 0 {
+                        eprintln!("[debug] plugin '{}' returned 0 anime results for query '{}'", name, query);
+                    } else {
+                        eprintln!("[debug] plugin '{}' returned {} anime results for query '{}'", name, count, query);
+                    }
+                    for m in v.drain(..) { all.push((name.clone(), m)); }
+                }
                 Ok(Err(e)) => eprintln!("Plugin {} fetchmedialist failed: {}", name, e),
                 Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} fetchmedialist timed out after {:?}", name, timeout),
                 Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (fetchmedialist)", name),
@@ -258,7 +287,10 @@ impl PluginManager {
             }
             let timeout = Duration::from_secs(20);
             return match rrx.recv_timeout(timeout) {
-                Ok(Ok(v)) => Ok(v),
+                Ok(Ok(v)) => {
+                    eprintln!("[debug] search_anime_for source='{}' query='{}' -> {} results", source, query, v.len());
+                    Ok(v)
+                },
                 Ok(Err(e)) => Err(anyhow!("{}", e)),
                 Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!("timeout after {:?}", timeout)),
                 Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow!("channel disconnected")),

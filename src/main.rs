@@ -5,8 +5,17 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use touring::prelude::MediaType;
 use std::io::Write; // for zip.write_all
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing (idempotent if already set by embedding app). Capture wasmtime_wasi_http internals.
+    // Users can override verbosity with RUST_LOG; default to info + http traces.
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info,wasmtime_wasi_http=trace,wasmtime_wasi=info,touring=debug");
+    }
+    let _ = fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init();
     // Create runtime for async library API and plugin loading
     let rt = tokio::runtime::Runtime::new()?;
 
@@ -337,7 +346,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn save_images(chapter_id: &str, urls: &[String], out_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn save_images(_chapter_id: &str, urls: &[String], out_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(out_dir).await.ok();
     let client = reqwest::Client::builder().user_agent("touring/0.1").build()?;
     for (i, url) in urls.iter().enumerate() {
@@ -380,7 +389,7 @@ async fn save_cbz(_chapter_id: &str, urls: &[String], out_file: &Path, force: bo
     Ok(())
 }
 
-async fn save_images_mockable(chapter_id: &str, urls: &[String], out_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn save_images_mockable(_chapter_id: &str, urls: &[String], out_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(out_dir).await.ok();
     let client = reqwest::Client::builder().user_agent("touring/0.1").build()?;
     for (i, url) in urls.iter().enumerate() {

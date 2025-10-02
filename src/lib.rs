@@ -135,7 +135,7 @@ impl Touring {
     /// Load all plugins from a directory.
     pub async fn load_plugins_from_directory(&self, dir: &Path) -> Result<()> {
         let mut pm = self.pm.lock().unwrap();
-        pm.load_plugins_from_directory(dir).await
+        pm.load_plugins_from_directory(dir)
     }
 
     /// List loaded plugin names.
