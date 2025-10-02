@@ -20,11 +20,8 @@ use serde::{Deserialize, Serialize};
 
 
 
-use crate::db::Database;
-use crate::plugins::{PluginManager, Media, Unit, MediaType, Asset, ProviderCapabilities};
-use crate::storage::Storage;
-use crate::mapping::{series_insert_from_media, series_source_from, chapter_insert_from_unit};
-use crate::types::{MediaCache, SearchEntry, media_to_cache, media_from_cache};
+use crate::aggregator::Aggregator;
+use crate::plugins::{Media, Unit, Asset, ProviderCapabilities};
 
 // --- Data structures for UI API ---
 
@@ -110,316 +107,102 @@ pub struct LibraryStats {
     pub expired_cache_entries: usize,
 }
 
-/// Async library entry point. Owns the database and a plugin manager.
+/// High-level façade for embedders. Delegates all media/search/cache logic to `Aggregator`.
 pub struct Touring {
-    db: Database,
-    pm: PluginManager,
-    // Caching TTLs (seconds)
-    search_ttl_secs: i64,
-    pages_ttl_secs: i64,
+    agg: Aggregator,
 }
 
 impl Touring {
     /// Initialize database and (optionally) run migrations. Does not start any internal runtimes.
     pub async fn connect(database_url: Option<&str>, run_migrations: bool) -> Result<Self> {
-        let db = Database::connect(database_url).await?;
-        if run_migrations { db.run_migrations().await?; }
-    let pm = PluginManager::new()?;
-        // TTLs via env with defaults
-        let search_ttl_secs = std::env::var("TOURING_SEARCH_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60 * 60);
-        let pages_ttl_secs = std::env::var("TOURING_PAGES_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(24 * 60 * 60);
-    Ok(Self { db, pm, search_ttl_secs, pages_ttl_secs })
+        let agg = Aggregator::new(database_url, run_migrations).await?;
+        Ok(Self { agg })
     }
 
     /// Load all plugins from a directory.
-    pub async fn load_plugins_from_directory(&mut self, dir: &Path) -> Result<()> { self.pm.load_plugins_from_directory(dir).await }
+    pub async fn load_plugins_from_directory(&mut self, dir: &Path) -> Result<()> { self.agg.load_plugins_from_directory(dir).await }
 
     /// List loaded plugin names.
-    pub fn list_plugins(&self) -> Vec<String> { self.pm.list_plugins() }
+    pub fn list_plugins(&self) -> Vec<String> { self.agg.list_plugins() }
 
     /// Get plugin capabilities (cached by default, or refresh).
-    pub async fn get_capabilities(&self, refresh: bool) -> Result<Vec<(String, ProviderCapabilities)>> {
-    self.pm.get_capabilities(refresh).await
-    }
+    pub async fn get_capabilities(&self, refresh: bool) -> Result<Vec<(String, ProviderCapabilities)>> { self.agg.get_capabilities(refresh).await }
 
     /// Get allowed hosts per plugin.
-    pub async fn get_allowed_hosts(&self) -> Result<Vec<(String, Vec<String>)>> {
-    self.pm.get_allowed_hosts().await
-    }
+    pub async fn get_allowed_hosts(&self) -> Result<Vec<(String, Vec<String>)>> { self.agg.get_allowed_hosts().await }
 
     /// Search manga with per-source caching; upserts series + mappings. Returns (source, media).
-    pub async fn search_manga_cached_with_sources(&self, query: &str, refresh: bool) -> Result<Vec<(String, Media)>> {
-        let norm = norm_query(query);
-        let now = current_epoch();
-        let sources = self.list_plugins();
-        let mut all = Vec::with_capacity(sources.len() * 10); // Pre-allocate based on expected results
-
-        for source in sources {
-            let key = format!("{}|search|manga|{}", source, norm);
-            let mut hit: Option<Vec<Media>> = None;
-            
-            // Try cache first if not refreshing
-            if !refresh {
-                if let Some(payload) = self.db.get_cache(&key, now).await.ok().flatten() {
-                    hit = Self::try_deserialize_media_cache(&payload, MediaType::Manga);
-                }
-            }
-
-            let list = if let Some(medias) = hit {
-                medias
-            } else {
-                // Cache miss -> query plugin (avoid spawn_blocking overhead for single calls)
-                let results = self.pm.search_manga_for(&source, query).await?;
-                
-                // Cache the results  
-                let payload = serde_json::to_string(&results.iter().map(media_to_cache).collect::<Vec<_>>())?;
-                let _ = self.db.put_cache(&key, &payload, now + self.search_ttl_secs).await;
-                results
-            };
-
-            // Upsert series mappings for all results from this source
-            for m in &list {
-                let _ = self.upsert_source(&source, "unknown").await;
-                let _ = self.get_or_create_series_id(&source, &m.id, m).await;
-            }
-            
-            // Add to results
-            for m in list {
-                all.push((source.clone(), m));
-            }
-        }
-        Ok(all)
-    }
+    pub async fn search_manga_cached_with_sources(&self, query: &str, refresh: bool) -> Result<Vec<(String, Media)>> { self.agg.search_manga_cached_with_sources(query, refresh).await }
 
     /// Search anime with per-source caching; upserts series + mappings. Returns (source, media).
-    pub async fn search_anime_cached_with_sources(&self, query: &str, refresh: bool) -> Result<Vec<(String, Media)>> {
-        let norm = norm_query(query);
-        let now = current_epoch();
-        let sources = self.list_plugins();
-        let mut all = Vec::with_capacity(sources.len() * 10); // Pre-allocate
-
-        for source in sources {
-            let key = format!("{}|search|anime|{}", source, norm);
-            let mut hit: Option<Vec<Media>> = None;
-            
-            // Try cache first if not refreshing
-            if !refresh {
-                if let Some(payload) = self.db.get_cache(&key, now).await.ok().flatten() {
-                    hit = Self::try_deserialize_media_cache(&payload, MediaType::Anime);
-                }
-            }
-
-            let list = if let Some(medias) = hit {
-                medias
-            } else {
-                // Cache miss -> query plugin
-                let mut results = self.pm.search_anime_for(&source, query).await?;
-                
-                // Ensure correct media type for anime
-                for m in &mut results { 
-                    m.mediatype = MediaType::Anime; 
-                }
-                
-                // Cache the results
-                let payload = serde_json::to_string(&results.iter().map(media_to_cache).collect::<Vec<_>>())?;
-                let _ = self.db.put_cache(&key, &payload, now + self.search_ttl_secs).await;
-                results
-            };
-
-            // Upsert series mappings for all results from this source
-            for m in &list {
-                let _ = self.upsert_source(&source, "unknown").await;
-                let _ = self.get_or_create_series_id(&source, &m.id, m).await;
-            }
-            
-            // Add to results
-            for m in list {
-                all.push((source.clone(), m));
-            }
-        }
-        Ok(all)
-    }
+    pub async fn search_anime_cached_with_sources(&self, query: &str, refresh: bool) -> Result<Vec<(String, Media)>> { self.agg.search_anime_cached_with_sources(query, refresh).await }
 
     /// Fetch chapters for a manga id; upserts chapters linked to canonical series id.
-    pub async fn get_manga_chapters(&self, external_manga_id: &str) -> Result<Vec<Unit>> {
-    let (source_opt, units) = self.pm.get_manga_chapters_with_source(external_manga_id).await?;
-        if let Some(source_id) = source_opt {
-            let media_stub = Media { id: external_manga_id.to_string(), mediatype: MediaType::Manga, title: String::new(), description: None, url: None, cover_url: None };
-            let series_id = self.get_or_create_series_id(&source_id, external_manga_id, &media_stub).await?;
-            let pool = self.db.pool().clone();
-            for u in units.iter().filter(|u| matches!(u.kind, crate::plugins::UnitKind::Chapter)) {
-                if let Some(existing) = dao::find_chapter_id_by_mapping(&pool, &series_id, &source_id, &u.id).await? {
-                    let ch = chapter_insert_from_unit(existing, series_id.clone(), source_id.clone(), u);
-                    let _ = crate::dao::upsert_chapter(&pool, &ch).await;
-                } else {
-                    let cid = uuid::Uuid::new_v4().to_string();
-                    let ch = chapter_insert_from_unit(cid, series_id.clone(), source_id.clone(), u);
-                    let _ = crate::dao::upsert_chapter(&pool, &ch).await;
-                }
-            }
-        }
-        Ok(units)
-    }
+    pub async fn get_manga_chapters(&self, external_manga_id: &str) -> Result<Vec<Unit>> { self.agg.get_manga_chapters(external_manga_id).await }
 
     /// Fetch episode list for an anime id; upserts and returns episodes.
-    pub async fn get_anime_episodes(&self, external_anime_id: &str) -> Result<Vec<Unit>> {
-    let (source_opt, units) = self.pm.get_anime_episodes_with_source(external_anime_id).await?;
-        if let Some(source_id) = source_opt {
-            let media_stub = Media { id: external_anime_id.to_string(), mediatype: MediaType::Anime, title: String::new(), description: None, url: None, cover_url: None };
-            let series_id = self.get_or_create_series_id(&source_id, external_anime_id, &media_stub).await?;
-            let pool = self.db.pool().clone();
-            for u in units.iter().filter(|u| matches!(u.kind, crate::plugins::UnitKind::Episode)) {
-                if let Some(existing) = dao::find_episode_id_by_mapping(&pool, &series_id, &source_id, &u.id).await? {
-                    let ep = crate::dao::EpisodeInsert {
-                        id: existing,
-                        series_id: series_id.clone(),
-                        source_id: source_id.clone(),
-                        external_id: u.id.clone(),
-                        number_text: u.number_text.clone(),
-                        number_num: u.number.map(|n| n as f64),
-                        title: Some(u.title.clone()).filter(|s| !s.is_empty()),
-                        lang: u.lang.clone(),
-                        season: u.group.clone(),
-                        published_at: u.published_at.clone(),
-                    };
-                    let _ = crate::dao::upsert_episode(&pool, &ep).await;
-                } else {
-                    let eid_new = uuid::Uuid::new_v4().to_string();
-                    let ep = crate::dao::EpisodeInsert {
-                        id: eid_new,
-                        series_id: series_id.clone(),
-                        source_id: source_id.clone(),
-                        external_id: u.id.clone(),
-                        number_text: u.number_text.clone(),
-                        number_num: u.number.map(|n| n as f64),
-                        title: Some(u.title.clone()).filter(|s| !s.is_empty()),
-                        lang: u.lang.clone(),
-                        season: u.group.clone(),
-                        published_at: u.published_at.clone(),
-                    };
-                    let _ = crate::dao::upsert_episode(&pool, &ep).await;
-                }
-            }
-        }
-        Ok(units)
-    }
+    pub async fn get_anime_episodes(&self, external_anime_id: &str) -> Result<Vec<Unit>> { self.agg.get_anime_episodes(external_anime_id).await }
 
     /// Fetch episode streams for an episode id; persists streams (dedupe by (episode_id, url)).
-    pub async fn get_episode_streams(&self, external_episode_id: &str) -> Result<Vec<Asset>> {
-    // Resolve canonical -> external if needed
-    let eid = self.resolve_episode_external_id(external_episode_id).await?;
-    let (src_opt, vids) = self.pm.get_episode_streams_with_source(&eid).await?;
-        if let Some(source_id) = src_opt {
-            let pool = self.db.pool().clone();
-            if let Some(canonical_eid) = crate::dao::find_episode_id_by_source_external(&pool, &source_id, &eid).await? {
-                let streams: Vec<crate::dao::StreamInsert> = vids.iter().map(|a| crate::dao::StreamInsert {
-                    episode_id: canonical_eid.clone(),
-                    url: a.url.clone(),
-                    quality: None,
-                    mime: a.mime.clone(),
-                }).collect();
-                let _ = crate::dao::upsert_streams(&pool, &canonical_eid, &streams).await;
-            }
-        }
-        Ok(vids)
-    }
+    pub async fn get_episode_streams(&self, external_episode_id: &str) -> Result<Vec<Asset>> { self.agg.get_episode_streams(external_episode_id).await }
 
     /// Fetch chapter images (URLs) with caching and optional refresh. Accepts canonical or external chapter id.
-    pub async fn get_chapter_images_with_refresh(&self, chapter_id: &str, refresh: bool) -> Result<Vec<String>> {
-        // Resolve canonical -> external if possible, but keep original too
-        let original_id = chapter_id.to_string();
-        let external_id = self.resolve_chapter_external_id(chapter_id).await?;
-        let key_orig = format!("all|pages|{}", original_id);
-        let key_ext = format!("all|pages|{}", external_id);
-        let now = current_epoch();
-
-        if !refresh {
-            // First try cache with the exact id the user provided (back-compat)
-            if let Some(payload) = self.db.get_cache(&key_orig, now).await.ok().flatten() {
-                if let Ok(urls) = serde_json::from_str::<Vec<String>>(&payload) { return Ok(urls); }
-            }
-            // Then try the external-id-based cache key
-            if key_ext != key_orig {
-                if let Some(payload) = self.db.get_cache(&key_ext, now).await.ok().flatten() {
-                    if let Ok(urls) = serde_json::from_str::<Vec<String>>(&payload) { return Ok(urls); }
-                }
-            }
-        }
-
-        // Miss -> call plugins; prefer trying with the ID the user provided first
-        let mut urls: Vec<String> = Vec::new();
-        for try_id in [original_id.as_str(), external_id.as_str()] {
-            let (_src_opt, u) = self.pm.get_chapter_images_with_source(try_id).await?;
-            if !u.is_empty() { urls = u; break; }
-            // If first attempt returns empty, try the other id
-            if try_id == external_id.as_str() { break; }
-        }
-
-        // Write-through with TTL into both keys for future hits
-        let payload = serde_json::to_string(&urls)?;
-        let expires_at = now + self.pages_ttl_secs;
-        let _ = self.db.put_cache(&key_ext, &payload, expires_at).await;
-        if key_orig != key_ext { let _ = self.db.put_cache(&key_orig, &payload, expires_at).await; }
-
-        Ok(urls)
-    }
+    pub async fn get_chapter_images_with_refresh(&self, chapter_id: &str, refresh: bool) -> Result<Vec<String>> { self.agg.get_chapter_images_with_refresh(chapter_id, refresh).await }
 
     // Convenience: accepts canonical or external chapter id
-    pub async fn get_chapter_images(&self, chapter_id: &str) -> Result<Vec<String>> {
-        self.get_chapter_images_with_refresh(chapter_id, false).await
-    }
+    pub async fn get_chapter_images(&self, chapter_id: &str) -> Result<Vec<String>> { self.agg.get_chapter_images(chapter_id).await }
 
     // --- Series management APIs ---
 
     pub async fn list_series(&self, kind: Option<&str>) -> Result<Vec<(String, String)>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         crate::dao::list_series(&pool, kind).await
     }
 
     pub async fn list_chapters_for_series(&self, series_id: &str) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         crate::dao::list_chapters_for_series(&pool, series_id).await
     }
 
     pub async fn list_episodes_for_series(&self, series_id: &str) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         crate::dao::list_episodes_for_series(&pool, series_id).await
     }
 
     pub async fn get_series_download_path(&self, series_id: &str) -> Result<Option<String>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         Ok(crate::dao::get_series_pref(&pool, series_id).await?.and_then(|p| p.download_path))
     }
 
     pub async fn set_series_download_path(&self, series_id: &str, path: Option<&str>) -> Result<()> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         crate::dao::set_series_download_path(&pool, series_id, path).await
     }
 
     pub async fn delete_series(&self, series_id: &str) -> Result<u64> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         crate::dao::delete_series(&pool, series_id).await
     }
 
     pub async fn delete_chapter(&self, chapter_id: &str) -> Result<u64> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         crate::dao::delete_chapter(&pool, chapter_id).await
     }
 
     pub async fn delete_episode(&self, episode_id: &str) -> Result<u64> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         crate::dao::delete_episode(&pool, episode_id).await
     }
 
     /// Resolve the canonical series id from a source id and the plugin's external media id
     pub async fn resolve_series_id(&self, source_id: &str, external_id: &str) -> Result<Option<String>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         crate::dao::find_series_id_by_source_external(&pool, source_id, external_id).await
     }
 
     /// Get series_id and naming info for a chapter
     pub async fn get_chapter_meta(&self, chapter_id: &str) -> Result<Option<(String, Option<f64>, Option<String>)>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         // Try canonical id first
         let row: Option<(String, Option<f64>, Option<String>)> = sqlx::query_as(
             "SELECT series_id, number_num, number_text FROM chapters WHERE id = ?"
@@ -440,7 +223,7 @@ impl Touring {
 
     /// Get series_id and naming info for an episode
     pub async fn get_episode_meta(&self, episode_id: &str) -> Result<Option<(String, Option<f64>, Option<String>)>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         let row: Option<(String, Option<f64>, Option<String>)> = sqlx::query_as(
             "SELECT series_id, number_num, number_text FROM episodes WHERE id = ?"
         )
@@ -457,11 +240,11 @@ impl Touring {
 
     /// Clear cache entries by prefix. Returns number of rows removed.
     pub async fn clear_cache_prefix(&self, prefix: Option<&str>) -> Result<u64> {
-        self.db.clear_cache_prefix(prefix).await.map_err(Into::into)
+        self.agg.clear_cache_prefix(prefix).await.map_err(Into::into)
     }
 
     /// Vacuum/compact the database (SQLite only; no-op on others).
-    pub async fn vacuum_db(&self) -> Result<()> { self.db.vacuum().await.map_err(Into::into) }
+    pub async fn vacuum_db(&self) -> Result<()> { self.agg.vacuum_db().await }
 
     // --- Download API for UI ---
 
@@ -629,7 +412,7 @@ impl Touring {
 
     /// Get full series information including metadata and preferences.
     pub async fn get_series_info(&self, series_id: &str) -> Result<Option<SeriesInfo>> {
-        let pool = self.db.pool().clone();
+    let pool = self.agg.database().pool().clone();
         let row: Option<(String, String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT id, kind, title, description, cover_url, status FROM series WHERE id = ?"
         )
@@ -667,7 +450,7 @@ impl Touring {
 
     /// Update series metadata (title, description, status, etc.).
     pub async fn update_series_metadata(&self, series_id: &str, updates: SeriesMetadataUpdate) -> Result<()> {
-        let pool = self.db.pool().clone();
+    let pool = self.agg.database().pool().clone();
         
         // Build dynamic query based on provided fields
         let mut query = "UPDATE series SET updated_at = CURRENT_TIMESTAMP".to_string();
@@ -707,7 +490,7 @@ impl Touring {
 
     /// Get all sources and external IDs for a series.
     pub async fn get_series_sources(&self, series_id: &str) -> Result<Vec<SeriesSource>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT source_id, external_id FROM series_sources WHERE series_id = ?"
         )
@@ -720,7 +503,7 @@ impl Touring {
 
     /// Add a new source mapping for a series.
     pub async fn add_series_source(&self, series_id: &str, source_id: &str, external_id: &str) -> Result<()> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         let link = crate::dao::SeriesSourceInsert {
             series_id: series_id.to_string(),
             source_id: source_id.to_string(),
@@ -731,7 +514,7 @@ impl Touring {
 
     /// Remove a source mapping for a series.
     pub async fn remove_series_source(&self, series_id: &str, source_id: &str, external_id: &str) -> Result<u64> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         let res = sqlx::query("DELETE FROM series_sources WHERE series_id = ? AND source_id = ? AND external_id = ?")
             .bind(series_id)
             .bind(source_id)
@@ -743,7 +526,7 @@ impl Touring {
 
     /// Get detailed chapter information including download status.
     pub async fn get_chapter_info(&self, chapter_id: &str) -> Result<Option<ChapterInfo>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         let row: Option<(String, String, String, Option<String>, Option<f64>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT id, series_id, external_id, number_text, number_num, title, lang, volume FROM chapters WHERE id = ?"
         )
@@ -773,7 +556,7 @@ impl Touring {
 
     /// Get detailed episode information.
     pub async fn get_episode_info(&self, episode_id: &str) -> Result<Option<EpisodeInfo>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         let row: Option<(String, String, String, Option<String>, Option<f64>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT id, series_id, external_id, number_text, number_num, title, lang, season FROM episodes WHERE id = ?"
         )
@@ -805,7 +588,7 @@ impl Touring {
 
     /// Search series in local database (for UI autocomplete/filtering).
     pub async fn search_local_series(&self, query: &str, kind: Option<&str>, limit: Option<usize>) -> Result<Vec<SeriesInfo>> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         let search_term = format!("%{}%", query);
         let limit_val = limit.unwrap_or(50) as i64;
         
@@ -862,7 +645,7 @@ impl Touring {
 
     /// Get statistics about the library (total series, chapters, episodes, etc.).
     pub async fn get_library_stats(&self) -> Result<LibraryStats> {
-        let pool = self.db.pool().clone();
+        let pool = self.agg.database().pool().clone();
         
         let total_series: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM series").fetch_one(&pool).await?;
         let manga_series: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM series WHERE kind = 'manga'").fetch_one(&pool).await?;
@@ -892,12 +675,12 @@ impl Touring {
 
     /// Refresh metadata for a series from all its sources.
     pub async fn refresh_series_metadata(&self, series_id: &str) -> Result<bool> {
-        let sources = self.get_series_sources(series_id).await?;
+    let sources = self.get_series_sources(series_id).await?;
         let mut updated = false;
         
         for source in sources {
             // Try to fetch fresh metadata from the source (manga domain)
-            let media_list = self.pm.search_manga_for(&source.source_id, &source.external_id).await.unwrap_or_default();
+            let media_list = self.agg.search_manga_cached_with_sources(&source.external_id, true).await.unwrap_or_default().into_iter().filter(|(s,_ )| s == &source.source_id).map(|(_,m)| m).collect::<Vec<_>>();
             
             // If we find a match, update the series metadata
             if let Some(media) = media_list.into_iter().find(|m| m.id == source.external_id) {
@@ -917,81 +700,17 @@ impl Touring {
 
     // --- helpers ---
 
-    async fn upsert_source(&self, id: &str, version: &str) -> Result<()> {
-        let pool = self.db.pool().clone();
-        crate::dao::upsert_source(&pool, &crate::dao::SourceInsert { id: id.to_string(), version: version.to_string() }).await.map_err(Into::into)
-    }
-
-    async fn get_or_create_series_id(&self, source_id: &str, external_id: &str, media: &Media) -> Result<String> {
-        let pool = self.db.pool().clone();
-        if let Some(existing) = crate::dao::find_series_id_by_source_external(&pool, source_id, external_id).await? {
-            return Ok(existing);
-        }
-        let new_id = uuid::Uuid::new_v4().to_string();
-        let s = series_insert_from_media(new_id.clone(), media);
-        crate::dao::upsert_series(&pool, &s).await?;
-        let link = series_source_from(new_id.clone(), source_id.to_string(), external_id.to_string());
-        crate::dao::upsert_series_source(&pool, &link).await?;
-        Ok(new_id)
-    }
-
-    async fn resolve_chapter_external_id(&self, id: &str) -> Result<String> {
-        let pool = self.db.pool().clone();
-        let ext: Option<String> = sqlx::query_scalar("SELECT external_id FROM chapters WHERE id = ? LIMIT 1")
-            .bind(id)
-            .fetch_optional(&pool)
-            .await?;
-        Ok(ext.unwrap_or_else(|| id.to_string()))
-    }
-
-    async fn resolve_episode_external_id(&self, id: &str) -> Result<String> {
-        let pool = self.db.pool().clone();
-        let ext: Option<String> = sqlx::query_scalar("SELECT external_id FROM episodes WHERE id = ? LIMIT 1")
-            .bind(id)
-            .fetch_optional(&pool)
-            .await?;
-        Ok(ext.unwrap_or_else(|| id.to_string()))
-    }
-    /// Helper to deserialize cache payload with fallback to legacy format
-    fn try_deserialize_media_cache(payload: &str, media_type: MediaType) -> Option<Vec<Media>> {
-        // Try new format first
-        if let Ok(items) = serde_json::from_str::<Vec<MediaCache>>(payload) {
-            let mut medias: Vec<Media> = items.into_iter().map(media_from_cache).collect();
-            // Ensure correct media type for anime from cache
-            if matches!(media_type, MediaType::Anime) {
-                for m in &mut medias {
-                    m.mediatype = MediaType::Anime;
-                }
-            }
-            return Some(medias);
-        }
-        
-        // Fallback to legacy format
-        if let Ok(entries) = serde_json::from_str::<Vec<SearchEntry>>(payload) {
-            let mut medias: Vec<Media> = entries.into_iter().map(|e| media_from_cache(e.media)).collect();
-            if matches!(media_type, MediaType::Anime) {
-                for m in &mut medias {
-                    m.mediatype = MediaType::Anime;
-                }
-            }
-            return Some(medias);
-        }
-        
-        None
-    }
 }
 
-// --- Helper functions (eliminate duplication from aggregator) ---
-
-fn norm_query(q: &str) -> String {
-    let trimmed = q.trim().to_ascii_lowercase();
-    let mut out = String::with_capacity(trimmed.len());
-    let mut last_space = false;
-    for ch in trimmed.chars() {
-        if ch.is_whitespace() { if !last_space { out.push(' '); last_space = true; } } else { out.push(ch); last_space = false; }
-    }
-    out
+impl Touring {
+    /// Direct access to underlying Aggregator (advanced use).
+    pub fn aggregator(&self) -> &Aggregator { &self.agg }
 }
+
+// Local helper needed for stats (avoid reaching into aggregator internals)
 fn current_epoch() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }

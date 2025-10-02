@@ -18,6 +18,8 @@ pub struct Aggregator {
 }
 
 impl Aggregator {
+    pub fn database(&self) -> &Database { &self.db }
+    pub fn plugin_manager(&self) -> &PluginManager { &self.pm }
     pub async fn new(database_url: Option<&str>, run_migrations: bool) -> Result<Self> {
         let db = Database::connect(database_url).await?;
         if run_migrations { db.run_migrations().await?; }
