@@ -1,4 +1,3 @@
-pub mod aggregator;
 pub mod db;
 pub mod plugins;
 pub mod storage;
@@ -16,7 +15,7 @@ pub mod prelude {
 
 use anyhow::Result;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 
@@ -114,7 +113,7 @@ pub struct LibraryStats {
 /// Async library entry point. Owns the database and a plugin manager.
 pub struct Touring {
     db: Database,
-    pm: Arc<Mutex<PluginManager>>, // plugin calls are blocking; guard with a Mutex and use spawn_blocking
+    pm: PluginManager,
     // Caching TTLs (seconds)
     search_ttl_secs: i64,
     pages_ttl_secs: i64,
@@ -125,36 +124,27 @@ impl Touring {
     pub async fn connect(database_url: Option<&str>, run_migrations: bool) -> Result<Self> {
         let db = Database::connect(database_url).await?;
         if run_migrations { db.run_migrations().await?; }
-        let pm = PluginManager::new()?;
+    let pm = PluginManager::new()?;
         // TTLs via env with defaults
         let search_ttl_secs = std::env::var("TOURING_SEARCH_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(60 * 60);
         let pages_ttl_secs = std::env::var("TOURING_PAGES_TTL_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(24 * 60 * 60);
-        Ok(Self { db, pm: Arc::new(Mutex::new(pm)), search_ttl_secs, pages_ttl_secs })
+    Ok(Self { db, pm, search_ttl_secs, pages_ttl_secs })
     }
 
     /// Load all plugins from a directory.
-    pub async fn load_plugins_from_directory(&self, dir: &Path) -> Result<()> {
-        let mut pm = self.pm.lock().unwrap();
-        pm.load_plugins_from_directory(dir)
-    }
+    pub async fn load_plugins_from_directory(&mut self, dir: &Path) -> Result<()> { self.pm.load_plugins_from_directory(dir).await }
 
     /// List loaded plugin names.
-    pub fn list_plugins(&self) -> Vec<String> { self.pm.lock().unwrap().list_plugins() }
+    pub fn list_plugins(&self) -> Vec<String> { self.pm.list_plugins() }
 
     /// Get plugin capabilities (cached by default, or refresh).
     pub async fn get_capabilities(&self, refresh: bool) -> Result<Vec<(String, ProviderCapabilities)>> {
-        let pm = self.pm.clone();
-        tokio::task::spawn_blocking(move || pm.lock().unwrap().get_capabilities(refresh))
-            .await
-            .unwrap()
+    self.pm.get_capabilities(refresh).await
     }
 
     /// Get allowed hosts per plugin.
     pub async fn get_allowed_hosts(&self) -> Result<Vec<(String, Vec<String>)>> {
-        let pm = self.pm.clone();
-        tokio::task::spawn_blocking(move || pm.lock().unwrap().get_allowed_hosts())
-            .await
-            .unwrap()
+    self.pm.get_allowed_hosts().await
     }
 
     /// Search manga with per-source caching; upserts series + mappings. Returns (source, media).
@@ -179,10 +169,7 @@ impl Touring {
                 medias
             } else {
                 // Cache miss -> query plugin (avoid spawn_blocking overhead for single calls)
-                let pm = self.pm.clone();
-                let src = source.clone();
-                let q = query.to_string();
-                let results = tokio::task::spawn_blocking(move || pm.lock().unwrap().search_manga_for(&src, &q)).await.unwrap()?;
+                let results = self.pm.search_manga_for(&source, query).await?;
                 
                 // Cache the results  
                 let payload = serde_json::to_string(&results.iter().map(media_to_cache).collect::<Vec<_>>())?;
@@ -226,10 +213,7 @@ impl Touring {
                 medias
             } else {
                 // Cache miss -> query plugin
-                let pm = self.pm.clone();
-                let src = source.clone();
-                let q = query.to_string();
-                let mut results = tokio::task::spawn_blocking(move || pm.lock().unwrap().search_anime_for(&src, &q)).await.unwrap()?;
+                let mut results = self.pm.search_anime_for(&source, query).await?;
                 
                 // Ensure correct media type for anime
                 for m in &mut results { 
@@ -258,9 +242,7 @@ impl Touring {
 
     /// Fetch chapters for a manga id; upserts chapters linked to canonical series id.
     pub async fn get_manga_chapters(&self, external_manga_id: &str) -> Result<Vec<Unit>> {
-        let pm = self.pm.clone();
-        let eid = external_manga_id.to_string();
-        let (source_opt, units) = tokio::task::spawn_blocking(move || pm.lock().unwrap().get_manga_chapters_with_source(&eid)).await.unwrap()?;
+    let (source_opt, units) = self.pm.get_manga_chapters_with_source(external_manga_id).await?;
         if let Some(source_id) = source_opt {
             let media_stub = Media { id: external_manga_id.to_string(), mediatype: MediaType::Manga, title: String::new(), description: None, url: None, cover_url: None };
             let series_id = self.get_or_create_series_id(&source_id, external_manga_id, &media_stub).await?;
@@ -281,9 +263,7 @@ impl Touring {
 
     /// Fetch episode list for an anime id; upserts and returns episodes.
     pub async fn get_anime_episodes(&self, external_anime_id: &str) -> Result<Vec<Unit>> {
-        let pm = self.pm.clone();
-        let eid = external_anime_id.to_string();
-        let (source_opt, units) = tokio::task::spawn_blocking(move || pm.lock().unwrap().get_anime_episodes_with_source(&eid)).await.unwrap()?;
+    let (source_opt, units) = self.pm.get_anime_episodes_with_source(external_anime_id).await?;
         if let Some(source_id) = source_opt {
             let media_stub = Media { id: external_anime_id.to_string(), mediatype: MediaType::Anime, title: String::new(), description: None, url: None, cover_url: None };
             let series_id = self.get_or_create_series_id(&source_id, external_anime_id, &media_stub).await?;
@@ -326,12 +306,9 @@ impl Touring {
 
     /// Fetch episode streams for an episode id; persists streams (dedupe by (episode_id, url)).
     pub async fn get_episode_streams(&self, external_episode_id: &str) -> Result<Vec<Asset>> {
-        let pm = self.pm.clone();
-        let eid_input = external_episode_id.to_string();
-        // Resolve canonical -> external if needed
-        let eid = self.resolve_episode_external_id(&eid_input).await?;
-        let eid_for_call = eid.clone();
-        let (src_opt, vids) = tokio::task::spawn_blocking(move || pm.lock().unwrap().get_episode_streams_with_source(&eid_for_call)).await.unwrap()?;
+    // Resolve canonical -> external if needed
+    let eid = self.resolve_episode_external_id(external_episode_id).await?;
+    let (src_opt, vids) = self.pm.get_episode_streams_with_source(&eid).await?;
         if let Some(source_id) = src_opt {
             let pool = self.db.pool().clone();
             if let Some(canonical_eid) = crate::dao::find_episode_id_by_source_external(&pool, &source_id, &eid).await? {
@@ -372,9 +349,7 @@ impl Touring {
         // Miss -> call plugins; prefer trying with the ID the user provided first
         let mut urls: Vec<String> = Vec::new();
         for try_id in [original_id.as_str(), external_id.as_str()] {
-            let pm = self.pm.clone();
-            let cid = try_id.to_string();
-            let (_src_opt, u) = tokio::task::spawn_blocking(move || pm.lock().unwrap().get_chapter_images_with_source(&cid)).await.unwrap()?;
+            let (_src_opt, u) = self.pm.get_chapter_images_with_source(try_id).await?;
             if !u.is_empty() { urls = u; break; }
             // If first attempt returns empty, try the other id
             if try_id == external_id.as_str() { break; }
@@ -921,14 +896,8 @@ impl Touring {
         let mut updated = false;
         
         for source in sources {
-            // Try to fetch fresh metadata for this series from the source
-            let pm = self.pm.clone();
-            let external_id = source.external_id.clone();
-            let source_id = source.source_id.clone();
-            
-            let media_list = tokio::task::spawn_blocking(move || {
-                pm.lock().unwrap().search_manga_for(&source_id, &external_id)
-            }).await.unwrap().unwrap_or_default();
+            // Try to fetch fresh metadata from the source (manga domain)
+            let media_list = self.pm.search_manga_for(&source.source_id, &source.external_id).await.unwrap_or_default();
             
             // If we find a match, update the series metadata
             if let Some(media) = media_list.into_iter().find(|m| m.id == source.external_id) {

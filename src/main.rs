@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize library API
-    let touring = rt.block_on(touring::Touring::connect(cli.database_url.as_deref(), !cli.no_migrations))?;
+    let mut touring = rt.block_on(touring::Touring::connect(cli.database_url.as_deref(), !cli.no_migrations))?;
 
     // Load plugins with the outer runtime
     let plugins_dir = cli.plugins_dir.clone().unwrap_or_else(|| "plugins".to_string());
