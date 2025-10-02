@@ -19,6 +19,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
+
+
 use crate::db::Database;
 use crate::plugins::{PluginManager, Media, Unit, MediaType, Asset, ProviderCapabilities};
 use crate::storage::Storage;
@@ -147,52 +149,57 @@ impl Touring {
             .unwrap()
     }
 
+    /// Get allowed hosts per plugin.
+    pub async fn get_allowed_hosts(&self) -> Result<Vec<(String, Vec<String>)>> {
+        let pm = self.pm.clone();
+        tokio::task::spawn_blocking(move || pm.lock().unwrap().get_allowed_hosts())
+            .await
+            .unwrap()
+    }
+
     /// Search manga with per-source caching; upserts series + mappings. Returns (source, media).
     pub async fn search_manga_cached_with_sources(&self, query: &str, refresh: bool) -> Result<Vec<(String, Media)>> {
         let norm = norm_query(query);
         let now = current_epoch();
-        let mut all: Vec<(String, Media)> = Vec::new();
         let sources = self.list_plugins();
+        let mut all = Vec::with_capacity(sources.len() * 10); // Pre-allocate based on expected results
+
         for source in sources {
             let key = format!("{}|search|manga|{}", source, norm);
             let mut hit: Option<Vec<Media>> = None;
+            
+            // Try cache first if not refreshing
             if !refresh {
                 if let Some(payload) = self.db.get_cache(&key, now).await.ok().flatten() {
-                    // New format: Vec<MediaCache>
-                    if let Ok(items) = serde_json::from_str::<Vec<MediaCache>>(&payload) {
-                        let medias: Vec<Media> = items.into_iter().map(media_from_cache).collect();
-                        hit = Some(medias);
-                    } else if let Ok(entries) = serde_json::from_str::<Vec<SearchEntry>>(&payload) {
-                        // Back-compat
-                        let medias: Vec<Media> = entries.into_iter().map(|e| media_from_cache(e.media)).collect();
-                        hit = Some(medias);
-                    }
+                    hit = Self::try_deserialize_media_cache(&payload, MediaType::Manga);
                 }
             }
 
             let list = if let Some(medias) = hit {
-                // Upsert per cached media
-                for m in &medias {
-                    let _ = self.upsert_source(&source, "unknown").await;
-                    let _ = self.get_or_create_series_id(&source, &m.id, m).await;
-                }
                 medias
             } else {
-                // Miss -> query the specific plugin
+                // Cache miss -> query plugin (avoid spawn_blocking overhead for single calls)
                 let pm = self.pm.clone();
                 let src = source.clone();
                 let q = query.to_string();
                 let results = tokio::task::spawn_blocking(move || pm.lock().unwrap().search_manga_for(&src, &q)).await.unwrap()?;
-                for m in &results {
-                    let _ = self.upsert_source(&source, "unknown").await;
-                    let _ = self.get_or_create_series_id(&source, &m.id, m).await;
-                }
+                
+                // Cache the results  
                 let payload = serde_json::to_string(&results.iter().map(media_to_cache).collect::<Vec<_>>())?;
                 let _ = self.db.put_cache(&key, &payload, now + self.search_ttl_secs).await;
                 results
             };
 
-            for m in list { all.push((source.clone(), m)); }
+            // Upsert series mappings for all results from this source
+            for m in &list {
+                let _ = self.upsert_source(&source, "unknown").await;
+                let _ = self.get_or_create_series_id(&source, &m.id, m).await;
+            }
+            
+            // Add to results
+            for m in list {
+                all.push((source.clone(), m));
+            }
         }
         Ok(all)
     }
@@ -201,47 +208,50 @@ impl Touring {
     pub async fn search_anime_cached_with_sources(&self, query: &str, refresh: bool) -> Result<Vec<(String, Media)>> {
         let norm = norm_query(query);
         let now = current_epoch();
-        let mut all: Vec<(String, Media)> = Vec::new();
         let sources = self.list_plugins();
+        let mut all = Vec::with_capacity(sources.len() * 10); // Pre-allocate
+
         for source in sources {
             let key = format!("{}|search|anime|{}", source, norm);
             let mut hit: Option<Vec<Media>> = None;
+            
+            // Try cache first if not refreshing
             if !refresh {
                 if let Some(payload) = self.db.get_cache(&key, now).await.ok().flatten() {
-                    if let Ok(items) = serde_json::from_str::<Vec<MediaCache>>(&payload) {
-                        let mut medias: Vec<Media> = items.into_iter().map(media_from_cache).collect();
-                        for m in &mut medias { m.mediatype = MediaType::Anime; }
-                        hit = Some(medias);
-                    } else if let Ok(entries) = serde_json::from_str::<Vec<SearchEntry>>(&payload) {
-                        let mut medias: Vec<Media> = entries.into_iter().map(|e| media_from_cache(e.media)).collect();
-                        for m in &mut medias { m.mediatype = MediaType::Anime; }
-                        hit = Some(medias);
-                    }
+                    hit = Self::try_deserialize_media_cache(&payload, MediaType::Anime);
                 }
             }
 
             let list = if let Some(medias) = hit {
-                for m in &medias {
-                    let _ = self.upsert_source(&source, "unknown").await;
-                    let _ = self.get_or_create_series_id(&source, &m.id, m).await;
-                }
                 medias
             } else {
+                // Cache miss -> query plugin
                 let pm = self.pm.clone();
                 let src = source.clone();
                 let q = query.to_string();
                 let mut results = tokio::task::spawn_blocking(move || pm.lock().unwrap().search_anime_for(&src, &q)).await.unwrap()?;
-                for m in &mut results { m.mediatype = MediaType::Anime; }
-                for m in &results {
-                    let _ = self.upsert_source(&source, "unknown").await;
-                    let _ = self.get_or_create_series_id(&source, &m.id, m).await;
+                
+                // Ensure correct media type for anime
+                for m in &mut results { 
+                    m.mediatype = MediaType::Anime; 
                 }
+                
+                // Cache the results
                 let payload = serde_json::to_string(&results.iter().map(media_to_cache).collect::<Vec<_>>())?;
                 let _ = self.db.put_cache(&key, &payload, now + self.search_ttl_secs).await;
                 results
             };
 
-            for m in list { all.push((source.clone(), m)); }
+            // Upsert series mappings for all results from this source
+            for m in &list {
+                let _ = self.upsert_source(&source, "unknown").await;
+                let _ = self.get_or_create_series_id(&source, &m.id, m).await;
+            }
+            
+            // Add to results
+            for m in list {
+                all.push((source.clone(), m));
+            }
         }
         Ok(all)
     }
@@ -257,11 +267,11 @@ impl Touring {
             let pool = self.db.pool().clone();
             for u in units.iter().filter(|u| matches!(u.kind, crate::plugins::UnitKind::Chapter)) {
                 if let Some(existing) = dao::find_chapter_id_by_mapping(&pool, &series_id, &source_id, &u.id).await? {
-                    let ch = chapter_insert_from_unit(&existing, &series_id, &source_id, u);
+                    let ch = chapter_insert_from_unit(existing, series_id.clone(), source_id.clone(), u);
                     let _ = crate::dao::upsert_chapter(&pool, &ch).await;
                 } else {
                     let cid = uuid::Uuid::new_v4().to_string();
-                    let ch = chapter_insert_from_unit(&cid, &series_id, &source_id, u);
+                    let ch = chapter_insert_from_unit(cid, series_id.clone(), source_id.clone(), u);
                     let _ = crate::dao::upsert_chapter(&pool, &ch).await;
                 }
             }
@@ -949,9 +959,9 @@ impl Touring {
             return Ok(existing);
         }
         let new_id = uuid::Uuid::new_v4().to_string();
-        let s = series_insert_from_media(&new_id, media);
+        let s = series_insert_from_media(new_id.clone(), media);
         crate::dao::upsert_series(&pool, &s).await?;
-        let link = series_source_from(&new_id, source_id, external_id);
+        let link = series_source_from(new_id.clone(), source_id.to_string(), external_id.to_string());
         crate::dao::upsert_series_source(&pool, &link).await?;
         Ok(new_id)
     }
@@ -973,9 +983,36 @@ impl Touring {
             .await?;
         Ok(ext.unwrap_or_else(|| id.to_string()))
     }
+    /// Helper to deserialize cache payload with fallback to legacy format
+    fn try_deserialize_media_cache(payload: &str, media_type: MediaType) -> Option<Vec<Media>> {
+        // Try new format first
+        if let Ok(items) = serde_json::from_str::<Vec<MediaCache>>(payload) {
+            let mut medias: Vec<Media> = items.into_iter().map(media_from_cache).collect();
+            // Ensure correct media type for anime from cache
+            if matches!(media_type, MediaType::Anime) {
+                for m in &mut medias {
+                    m.mediatype = MediaType::Anime;
+                }
+            }
+            return Some(medias);
+        }
+        
+        // Fallback to legacy format
+        if let Ok(entries) = serde_json::from_str::<Vec<SearchEntry>>(payload) {
+            let mut medias: Vec<Media> = entries.into_iter().map(|e| media_from_cache(e.media)).collect();
+            if matches!(media_type, MediaType::Anime) {
+                for m in &mut medias {
+                    m.mediatype = MediaType::Anime;
+                }
+            }
+            return Some(medias);
+        }
+        
+        None
+    }
 }
 
-// --- types for cache serialization (duplicated from aggregator) ---
+// --- Helper functions (eliminate duplication from aggregator) ---
 
 fn norm_query(q: &str) -> String {
     let trimmed = q.trim().to_ascii_lowercase();

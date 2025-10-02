@@ -27,10 +27,8 @@ Desktop.ini
 
 /plugins
 
-/plugin-interface/target
-/plugin-interface/Cargo.lock
-/plugin-interface/wit/deps
-/plugin-interface/wit/_cache
+/wit/deps
+/wit/_cache
 
 /touring-bridge/target
 /touring-bridge/Cargo.lock

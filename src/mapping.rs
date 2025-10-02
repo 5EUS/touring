@@ -18,9 +18,9 @@ pub fn chapter_id_from(source_id: &str, unit: &Unit) -> String {
     format!("{}:{}:{}", source_id, kind, unit.id)
 }
 
-pub fn series_insert_from_media(id: &str, media: &Media) -> SeriesInsert {
+pub fn series_insert_from_media(id: String, media: &Media) -> SeriesInsert {
     SeriesInsert {
-        id: id.to_string(),
+        id,
         kind: kind_str(&media.mediatype).to_string(),
         title: media.title.clone(),
         alt_titles: None,
@@ -31,15 +31,15 @@ pub fn series_insert_from_media(id: &str, media: &Media) -> SeriesInsert {
     }
 }
 
-pub fn series_source_from(series_id: &str, source_id: &str, external_id: &str) -> SeriesSourceInsert {
-    SeriesSourceInsert { series_id: series_id.to_string(), source_id: source_id.to_string(), external_id: external_id.to_string() }
+pub fn series_source_from(series_id: String, source_id: String, external_id: String) -> SeriesSourceInsert {
+    SeriesSourceInsert { series_id, source_id, external_id }
 }
 
-pub fn chapter_insert_from_unit(id: &str, series_id: &str, source_id: &str, u: &Unit) -> ChapterInsert {
+pub fn chapter_insert_from_unit(id: String, series_id: String, source_id: String, u: &Unit) -> ChapterInsert {
     ChapterInsert {
-        id: id.to_string(),
-        series_id: series_id.to_string(),
-        source_id: source_id.to_string(),
+        id,
+        series_id,
+        source_id,
         external_id: u.id.clone(),
         number_text: u.number_text.clone(),
         number_num: u.number.map(|n| n as f64),

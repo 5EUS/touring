@@ -53,9 +53,9 @@ impl Aggregator {
             }
             // Create new canonical series
             let new_id = uuid::Uuid::new_v4().to_string();
-            let s = series_insert_from_media(&new_id, media);
+            let s = series_insert_from_media(new_id.clone(), media);
             dao::upsert_series(&pool, &s).await?;
-            let link = series_source_from(&new_id, source_id, external_id);
+            let link = series_source_from(new_id.clone(), source_id.to_string(), external_id.to_string());
             dao::upsert_series_source(&pool, &link).await?;
             Ok(new_id)
         })
@@ -89,47 +89,42 @@ impl Aggregator {
     pub fn search_manga_cached_with_sources(&mut self, query: &str, refresh: bool) -> Result<Vec<(String, Media)>> {
         let norm = Self::norm_query(query);
         let now = current_epoch();
-        let mut all: Vec<(String, Media)> = Vec::new();
+        let sources = self.pm.list_plugins();
+        let mut all = Vec::with_capacity(sources.len() * 10); // Pre-allocate
 
-        for source in self.pm.list_plugins() {
+        for source in sources {
             let key = format!("{}|search|manga|{}", source, norm);
             let mut hit: Option<Vec<Media>> = None;
 
+            // Try cache first if not refreshing
             if !refresh {
                 if let Some(payload) = self.rt.block_on(self.db.get_cache(&key, now)).ok().flatten() {
-                    // Prefer new format: Vec<MediaCache>
-                    if let Ok(items) = serde_json::from_str::<Vec<MediaCache>>(&payload) {
-                        let medias: Vec<Media> = items.into_iter().map(media_from_cache).collect();
-                        hit = Some(medias);
-                    } else if let Ok(entries) = serde_json::from_str::<Vec<SearchEntry>>(&payload) {
-                        // Back-compat from previous global cache format
-                        let medias: Vec<Media> = entries.into_iter().map(|e| media_from_cache(e.media)).collect();
-                        hit = Some(medias);
-                    }
+                    hit = Self::try_deserialize_media_cache(&payload, MediaType::Manga);
                 }
             }
 
             let list = if let Some(medias) = hit {
-                // Upsert for each media from cache
-                for m in &medias {
-                    let _ = self.upsert_source(&source, "unknown");
-                    let _ = self.get_or_create_series_id(&source, &m.id, m);
-                }
                 medias
             } else {
-                // Miss -> query this plugin only
+                // Cache miss -> query plugin
                 let results = self.pm.search_manga_for(&source, query)?;
-                for m in &results {
-                    let _ = self.upsert_source(&source, "unknown");
-                    let _ = self.get_or_create_series_id(&source, &m.id, m);
-                }
-                // Write-through per source
+                
+                // Cache the results
                 let payload = serde_json::to_string(&results.iter().map(media_to_cache).collect::<Vec<_>>())?;
                 let _ = self.rt.block_on(self.db.put_cache(&key, &payload, now + self.search_ttl_secs));
                 results
             };
 
-            for m in list { all.push((source.clone(), m)); }
+            // Upsert series mappings for all results from this source
+            for m in &list {
+                let _ = self.upsert_source(&source, "unknown");
+                let _ = self.get_or_create_series_id(&source, &m.id, m);
+            }
+            
+            // Add to results
+            for m in list {
+                all.push((source.clone(), m));
+            }
         }
 
         Ok(all)
@@ -139,45 +134,47 @@ impl Aggregator {
     pub fn search_anime_cached_with_sources(&mut self, query: &str, refresh: bool) -> Result<Vec<(String, Media)>> {
         let norm = Self::norm_query(query);
         let now = current_epoch();
-        let mut all: Vec<(String, Media)> = Vec::new();
+        let sources = self.pm.list_plugins();
+        let mut all = Vec::with_capacity(sources.len() * 10); // Pre-allocate
 
-        for source in self.pm.list_plugins() {
+        for source in sources {
             let key = format!("{}|search|anime|{}", source, norm);
             let mut hit: Option<Vec<Media>> = None;
 
+            // Try cache first if not refreshing
             if !refresh {
                 if let Some(payload) = self.rt.block_on(self.db.get_cache(&key, now)).ok().flatten() {
-                    if let Ok(items) = serde_json::from_str::<Vec<MediaCache>>(&payload) {
-                        let mut medias: Vec<Media> = items.into_iter().map(media_from_cache).collect();
-                        for m in &mut medias { m.mediatype = MediaType::Anime; }
-                        hit = Some(medias);
-                    } else if let Ok(entries) = serde_json::from_str::<Vec<SearchEntry>>(&payload) {
-                        let mut medias: Vec<Media> = entries.into_iter().map(|e| media_from_cache(e.media)).collect();
-                        for m in &mut medias { m.mediatype = MediaType::Anime; }
-                        hit = Some(medias);
-                    }
+                    hit = Self::try_deserialize_media_cache(&payload, MediaType::Anime);
                 }
             }
 
             let list = if let Some(medias) = hit {
-                for m in &medias {
-                    let _ = self.upsert_source(&source, "unknown");
-                    let _ = self.get_or_create_series_id(&source, &m.id, m);
-                }
                 medias
             } else {
+                // Cache miss -> query plugin
                 let mut results = self.pm.search_anime_for(&source, query)?;
-                for m in &mut results { m.mediatype = MediaType::Anime; }
-                for m in &results {
-                    let _ = self.upsert_source(&source, "unknown");
-                    let _ = self.get_or_create_series_id(&source, &m.id, m);
+                
+                // Ensure correct media type for anime
+                for m in &mut results { 
+                    m.mediatype = MediaType::Anime; 
                 }
+                
+                // Cache the results
                 let payload = serde_json::to_string(&results.iter().map(media_to_cache).collect::<Vec<_>>())?;
                 let _ = self.rt.block_on(self.db.put_cache(&key, &payload, now + self.search_ttl_secs));
                 results
             };
 
-            for m in list { all.push((source.clone(), m)); }
+            // Upsert series mappings for all results from this source
+            for m in &list {
+                let _ = self.upsert_source(&source, "unknown");
+                let _ = self.get_or_create_series_id(&source, &m.id, m);
+            }
+            
+            // Add to results
+            for m in list {
+                all.push((source.clone(), m));
+            }
         }
 
         Ok(all)
@@ -196,11 +193,11 @@ impl Aggregator {
                     // Get or create chapter canonical id by mapping lookup
                     if let Some(existing) = dao::find_chapter_id_by_mapping(&pool, &series_id, &source_id, &u.id).await? {
                         // Update existing
-                        let ch = chapter_insert_from_unit(&existing, &series_id, &source_id, u);
+                        let ch = chapter_insert_from_unit(existing, series_id.clone(), source_id.clone(), u);
                         let _ = dao::upsert_chapter(&pool, &ch).await;
                     } else {
                         let cid = uuid::Uuid::new_v4().to_string();
-                        let ch = chapter_insert_from_unit(&cid, &series_id, &source_id, u);
+                        let ch = chapter_insert_from_unit(cid, series_id.clone(), source_id.clone(), u);
                         let _ = dao::upsert_chapter(&pool, &ch).await;
                     }
                 }
@@ -358,6 +355,39 @@ impl Aggregator {
     /// List capabilities per plugin. If refresh is true, call plugins, else use cached.
     pub fn get_capabilities(&mut self, refresh: bool) -> Result<Vec<(String, ProviderCapabilities)>> {
         self.pm.get_capabilities(refresh)
+    }
+
+    /// Get allowed hosts per plugin.
+    pub fn get_allowed_hosts(&mut self) -> Result<Vec<(String, Vec<String>)>> {
+        self.pm.get_allowed_hosts()
+    }
+
+    /// Helper to deserialize cache payload with fallback to legacy format
+    fn try_deserialize_media_cache(payload: &str, media_type: MediaType) -> Option<Vec<Media>> {
+        // Try new format first
+        if let Ok(items) = serde_json::from_str::<Vec<MediaCache>>(payload) {
+            let mut medias: Vec<Media> = items.into_iter().map(media_from_cache).collect();
+            // Ensure correct media type for anime from cache
+            if matches!(media_type, MediaType::Anime) {
+                for m in &mut medias {
+                    m.mediatype = MediaType::Anime;
+                }
+            }
+            return Some(medias);
+        }
+        
+        // Fallback to legacy format
+        if let Ok(entries) = serde_json::from_str::<Vec<SearchEntry>>(payload) {
+            let mut medias: Vec<Media> = entries.into_iter().map(|e| media_from_cache(e.media)).collect();
+            if matches!(media_type, MediaType::Anime) {
+                for m in &mut medias {
+                    m.mediatype = MediaType::Anime;
+                }
+            }
+            return Some(medias);
+        }
+        
+        None
     }
 }
 

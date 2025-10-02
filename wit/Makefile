@@ -1,7 +1,7 @@
 # Plugin Interface Library Makefile
 # Manages WIT files and generates bindings for both host and guest
 
-WIT_DIR := $(CURDIR)/wit
+WIT_DIR := $(CURDIR)/
 SRC_DIR := $(CURDIR)/src
 WORLD   := library
 

@@ -36,6 +36,8 @@ pub enum Commands {
         #[arg(long)]
         refresh: bool,
     },
+    /// Show allowed hosts per plugin
+    AllowedHosts,
     /// Search for manga
     Manga {
         /// Query to search for

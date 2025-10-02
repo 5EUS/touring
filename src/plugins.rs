@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Sender, Receiver};
 // Generate WIT bindings from shared plugin-interface (generic library world)
 wasmtime::component::bindgen!({
     world: "library",
-    path: "plugin-interface/wit/",
+    path: "wit/",
 });
 
 mod host;
@@ -23,6 +23,7 @@ enum PluginCommand {
     FetchUnits { media_id: String, resp: Sender<anyhow::Result<Vec<Unit>>> },
     FetchAssets { unit_id: String, resp: Sender<anyhow::Result<Vec<Asset>>> },
     GetCapabilities { refresh: bool, resp: Sender<anyhow::Result<ProviderCapabilities>> },
+    GetAllowedHosts { resp: Sender<anyhow::Result<Vec<String>>> },
     Shutdown,
 }
 
@@ -47,6 +48,8 @@ impl PluginManager {
         config.wasm_component_model(true);
         config.async_support(false);
         config.epoch_interruption(true);
+        
+        config.strategy(wasmtime::Strategy::Cranelift);
         let engine = Arc::new(Engine::new(&config)?);
 
         // Start epoch ticker (10ms)
@@ -104,6 +107,10 @@ impl PluginManager {
                         let r = if refresh { plugin.get_capabilities_refresh() } else { plugin.get_capabilities_cached() };
                         let _ = resp.send(r.map_err(|e| e));
                     }
+                    Ok(PluginCommand::GetAllowedHosts { resp }) => {
+                        let hosts = plugin.allowed_hosts.clone().unwrap_or_default();
+                        let _ = resp.send(Ok(hosts));
+                    }
                     Ok(PluginCommand::Shutdown) | Err(_) => break,
                 }
             }
@@ -123,6 +130,13 @@ impl PluginManager {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("wasm") {
+                // Check if corresponding .toml file exists
+                let toml_path = path.with_extension("toml");
+                if !toml_path.exists() {
+                    eprintln!("Rejecting plugin {}: no corresponding .toml configuration file found", path.display());
+                    continue;
+                }
+                
                 if let Err(e) = self.load_plugin(&path).await {
                     eprintln!("Failed to load plugin {}: {}", path.display(), e);
                 }
@@ -149,6 +163,25 @@ impl PluginManager {
                 Ok(Err(e)) => eprintln!("Plugin {} get_capabilities failed: {}", w.name, e),
                 Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} get_capabilities timed out after {:?}", w.name, timeout),
                 Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (get_capabilities)", w.name),
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_allowed_hosts(&mut self) -> Result<Vec<(String, Vec<String>)>> {
+        let mut out = Vec::new();
+        let timeout = Duration::from_secs(10);
+        for w in &self.workers {
+            let (rtx, rrx) = mpsc::channel();
+            if let Err(e) = w.tx.send(PluginCommand::GetAllowedHosts { resp: rtx }) {
+                eprintln!("Plugin {} send error (get_allowed_hosts): {}", w.name, e);
+                continue;
+            }
+            match rrx.recv_timeout(timeout) {
+                Ok(Ok(hosts)) => out.push((w.name.clone(), hosts)),
+                Ok(Err(e)) => eprintln!("Plugin {} get_allowed_hosts failed: {}", w.name, e),
+                Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Plugin {} get_allowed_hosts timed out after {:?}", w.name, timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => eprintln!("Plugin {} channel disconnected (get_allowed_hosts)", w.name),
             }
         }
         Ok(out)

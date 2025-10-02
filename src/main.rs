@@ -61,6 +61,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}:\n  media:  {}\n  units:  {}\n  assets: {}", name, media.join(", "), units.join(", "), assets.join(", "));
             }
         }
+        Commands::AllowedHosts => {
+            let hosts = rt.block_on(touring.get_allowed_hosts())?;
+            for (name, host_list) in hosts {
+                if host_list.is_empty() {
+                    println!("{}:\n  all hosts allowed", name);
+                } else {
+                    println!("{}:\n  {}", name, host_list.join(", "));
+                }
+            }
+        }
         Commands::Manga { query, refresh, json } => {
             let pairs = rt.block_on(touring.search_manga_cached_with_sources(&query, refresh))?;
             if json {
