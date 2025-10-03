@@ -83,7 +83,18 @@ impl PluginManager {
         let interval = self.epoch_interval;
         // Instantiate plugin (async)
         // Use a small multi-thread runtime per plugin only for its internal async host calls
-        let rt_arc = std::sync::Arc::new(tokio::runtime::Builder::new_multi_thread().enable_all().worker_threads(2).build()?);
+        // On mobile, use 1 worker thread to reduce overhead; desktop uses 2
+        let worker_threads = if cfg!(target_os = "ios") || cfg!(target_os = "android") {
+            1
+        } else {
+            2
+        };
+        let rt_arc = std::sync::Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(worker_threads)
+                .build()?
+        );
         // Instantiate plugin using current async context
         let plugin = Plugin::new_async(&engine, &path, epoch_ticks, interval, rt_arc.clone()).await?;
         let name = plugin.name.clone();

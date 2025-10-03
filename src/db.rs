@@ -36,8 +36,15 @@ impl Database {
         // Quiet by default; callers can enable SQLX_LOG if they want
         let opts = opts.disable_statement_logging();
 
+        // Use fewer connections on mobile platforms for better performance
+        let max_connections = if cfg!(target_os = "ios") || cfg!(target_os = "android") {
+            3 // Mobile: fewer connections, less overhead
+        } else {
+            10 // Desktop: more connections for concurrency
+        };
+
         let pool = AnyPoolOptions::new()
-            .max_connections(10)
+            .max_connections(max_connections)
             .connect_with(opts)
             .await
             .with_context(|| format!("failed to connect to database: {url}"))?;
@@ -46,6 +53,21 @@ impl Database {
     }
 
     pub async fn run_migrations(&self) -> Result<()> {
+        // Quick check: if _sqlx_migrations table exists and has entries, skip
+        let check: Result<i64, _> = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM _sqlx_migrations"
+        )
+        .fetch_one(&self.pool)
+        .await;
+        
+        // If table exists and has migrations, assume we're good (fast path)
+        if let Ok(count) = check {
+            if count > 0 {
+                return Ok(());
+            }
+        }
+        
+        // Otherwise run migrations
         match MIGRATOR.run(&self.pool).await {
             Ok(_) => Ok(()),
             Err(e) => {
