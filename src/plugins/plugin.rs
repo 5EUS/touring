@@ -150,6 +150,7 @@ impl Plugin {
             let typed = func.typed::<(MediaType, String), (Vec<Media>,)>(&this.store)?;
             let (result_vec,) = this.rt.block_on(typed.call_async(&mut this.store, (kind.clone(), query.to_string())))
                 .map_err(|e| anyhow!("Failed to call fetchmedialist async: {}", e))?;
+            this.rt.block_on(typed.post_return_async(&mut this.store))?;
             Ok(result_vec)
         }, "fetchmedialist");
         self.clear_deadline();
@@ -191,6 +192,7 @@ impl Plugin {
             let typed = func.typed::<(String,), (Vec<Unit>,)>(&this.store)?;
             let (result_vec,) = this.rt.block_on(typed.call_async(&mut this.store, (media_id.to_string(),)))
                 .map_err(|e| anyhow!("Failed to call fetchunits async: {}", e))?;
+            this.rt.block_on(typed.post_return_async(&mut this.store))?;
             Ok(result_vec)
         }, "fetchunits");
         self.clear_deadline();
@@ -218,6 +220,7 @@ impl Plugin {
             let typed = func.typed::<(String,), (Vec<Asset>,)>(&this.store)?;
             let (result_vec,) = this.rt.block_on(typed.call_async(&mut this.store, (unit_id.to_string(),)))
                 .map_err(|e| anyhow!("Failed to call fetchassets async: {}", e))?;
+            this.rt.block_on(typed.post_return_async(&mut this.store))?;
             Ok(result_vec)
         }, "fetchassets");
         self.clear_deadline();
@@ -244,6 +247,7 @@ impl Plugin {
             let typed = func.typed::<(), (ProviderCapabilities,)>(&this.store)?;
             let (caps,) = this.rt.block_on(typed.call_async(&mut this.store, ()))
                 .map_err(|e| anyhow!("Failed to call getcapabilities async: {}", e))?;
+            this.rt.block_on(typed.post_return_async(&mut this.store))?;
             Ok(caps)
         }, "getcapabilities");
         self.clear_deadline();
