@@ -1,17 +1,20 @@
 mod cli;
 
-use cli::{Cli, Commands, DownloadCmd, SeriesCmd};
 use clap::Parser;
+use cli::{Cli, Commands, DownloadCmd, SeriesCmd};
+use std::io::Write; // for zip.write_all
 use std::path::{Path, PathBuf};
 use touring::prelude::MediaType;
-use std::io::Write; // for zip.write_all
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing (idempotent if already set by embedding app). Capture wasmtime_wasi_http internals.
     // Users can override verbosity with RUST_LOG; default to info + http traces.
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info,wasmtime_wasi_http=trace,wasmtime_wasi=info,touring=debug");
+        std::env::set_var(
+            "RUST_LOG",
+            "info,wasmtime_wasi_http=trace,wasmtime_wasi=info,touring=debug",
+        );
     }
     let _ = fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -23,24 +26,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Fallback to environment variables if CLI flags not provided
     if cli.database_url.is_none() {
-        if let Ok(v) = std::env::var("TOURING_DATABASE_URL") { if !v.is_empty() { cli.database_url = Some(v); } }
+        if let Ok(v) = std::env::var("TOURING_DATABASE_URL") {
+            if !v.is_empty() {
+                cli.database_url = Some(v);
+            }
+        }
     }
     if !cli.no_migrations {
         if let Ok(v) = std::env::var("TOURING_NO_MIGRATIONS") {
             let v = v.to_ascii_lowercase();
-            if v == "1" || v == "true" || v == "yes" { cli.no_migrations = true; }
+            if v == "1" || v == "true" || v == "yes" {
+                cli.no_migrations = true;
+            }
         }
     }
     if cli.plugins_dir.is_none() {
-        if let Ok(v) = std::env::var("TOURING_PLUGINS_DIR") { if !v.is_empty() { cli.plugins_dir = Some(v); } }
+        if let Ok(v) = std::env::var("TOURING_PLUGINS_DIR") {
+            if !v.is_empty() {
+                cli.plugins_dir = Some(v);
+            }
+        }
     }
 
     // Initialize library API
-    let mut touring = rt.block_on(touring::Touring::connect(cli.database_url.as_deref(), !cli.no_migrations))?;
+    let mut touring = rt.block_on(touring::Touring::connect(
+        cli.database_url.as_deref(),
+        !cli.no_migrations,
+    ))?;
 
     // Load plugins with the outer runtime
-    let plugins_dir = cli.plugins_dir.clone().unwrap_or_else(|| "plugins".to_string());
-    rt.block_on(async { touring.load_plugins_from_directory(Path::new(&plugins_dir)).await })?;
+    let plugins_dir = cli
+        .plugins_dir
+        .clone()
+        .unwrap_or_else(|| "plugins".to_string());
+    rt.block_on(async {
+        touring
+            .load_plugins_from_directory(Path::new(&plugins_dir))
+            .await
+    })?;
 
     match cli.command {
         Commands::Plugins { name } => {
@@ -346,33 +369,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn save_images(_chapter_id: &str, urls: &[String], out_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn save_images(
+    _chapter_id: &str,
+    urls: &[String],
+    out_dir: &Path,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(out_dir).await.ok();
-    let client = reqwest::Client::builder().user_agent("touring/0.1").build()?;
+    let client = reqwest::Client::builder()
+        .user_agent("touring/0.1")
+        .build()?;
     for (i, url) in urls.iter().enumerate() {
         let fname = format!("{:04}.jpg", i + 1);
         let path = out_dir.join(fname);
         if !force {
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) { continue; }
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                continue;
+            }
         }
         let resp = client.get(url).send().await?;
-        if !resp.status().is_success() { eprintln!("Failed to download {}: {}", url, resp.status()); continue; }
+        if !resp.status().is_success() {
+            eprintln!("Failed to download {}: {}", url, resp.status());
+            continue;
+        }
         let bytes = resp.bytes().await?;
         tokio::fs::write(&path, &bytes).await?;
     }
     Ok(())
 }
 
-async fn save_cbz(_chapter_id: &str, urls: &[String], out_file: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if !force && tokio::fs::try_exists(out_file).await.unwrap_or(false) { return Ok(()); }
+async fn save_cbz(
+    _chapter_id: &str,
+    urls: &[String],
+    out_file: &Path,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !force && tokio::fs::try_exists(out_file).await.unwrap_or(false) {
+        return Ok(());
+    }
     let tmp_dir = out_file.with_extension("tmpdir");
     tokio::fs::create_dir_all(&tmp_dir).await.ok();
     save_images(_chapter_id, urls, &tmp_dir, true).await?;
     // Zip the directory into a CBZ
     let file = std::fs::File::create(out_file)?;
     let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    let mut entries: Vec<_> = std::fs::read_dir(&tmp_dir)?.filter_map(|e| e.ok()).collect();
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut entries: Vec<_> = std::fs::read_dir(&tmp_dir)?
+        .filter_map(|e| e.ok())
+        .collect();
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let path = entry.path();
@@ -389,14 +434,23 @@ async fn save_cbz(_chapter_id: &str, urls: &[String], out_file: &Path, force: bo
     Ok(())
 }
 
-async fn save_images_mockable(_chapter_id: &str, urls: &[String], out_dir: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn save_images_mockable(
+    _chapter_id: &str,
+    urls: &[String],
+    out_dir: &Path,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(out_dir).await.ok();
-    let client = reqwest::Client::builder().user_agent("touring/0.1").build()?;
+    let client = reqwest::Client::builder()
+        .user_agent("touring/0.1")
+        .build()?;
     for (i, url) in urls.iter().enumerate() {
         let fname = format!("{:04}.jpg", i + 1);
         let path = out_dir.join(fname);
         if !force {
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) { continue; }
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                continue;
+            }
         }
         if url.starts_with("mock://") {
             // write simple placeholder bytes
@@ -404,23 +458,36 @@ async fn save_images_mockable(_chapter_id: &str, urls: &[String], out_dir: &Path
             continue;
         }
         let resp = client.get(url).send().await?;
-        if !resp.status().is_success() { eprintln!("Failed to download {}: {}", url, resp.status()); continue; }
+        if !resp.status().is_success() {
+            eprintln!("Failed to download {}: {}", url, resp.status());
+            continue;
+        }
         let bytes = resp.bytes().await?;
         tokio::fs::write(&path, &bytes).await?;
     }
     Ok(())
 }
 
-async fn save_cbz_mockable(_chapter_id: &str, urls: &[String], out_file: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if !force && tokio::fs::try_exists(out_file).await.unwrap_or(false) { return Ok(()); }
+async fn save_cbz_mockable(
+    _chapter_id: &str,
+    urls: &[String],
+    out_file: &Path,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !force && tokio::fs::try_exists(out_file).await.unwrap_or(false) {
+        return Ok(());
+    }
     let tmp_dir = out_file.with_extension("tmpdir");
     tokio::fs::create_dir_all(&tmp_dir).await.ok();
     save_images_mockable(_chapter_id, urls, &tmp_dir, true).await?;
     // Zip the directory into a CBZ
     let file = std::fs::File::create(out_file)?;
     let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    let mut entries: Vec<_> = std::fs::read_dir(&tmp_dir)?.filter_map(|e| e.ok()).collect();
+    let options =
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut entries: Vec<_> = std::fs::read_dir(&tmp_dir)?
+        .filter_map(|e| e.ok())
+        .collect();
     entries.sort_by_key(|e| e.file_name());
     for entry in entries {
         let path = entry.path();

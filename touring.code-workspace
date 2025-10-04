@@ -7,14 +7,10 @@
 			"path": "."
 		},
 		{
-			"path": "../nefarious_plugin"
-		},
-		{
-			"path": "../test_plugin"
-		},
-		{
 			"path": "../touring_ui"
 		}
 	],
-	"settings": {}
+	"settings": {
+		"java.configuration.updateBuildConfiguration": "interactive"
+	}
 }

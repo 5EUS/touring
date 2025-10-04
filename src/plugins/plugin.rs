@@ -1,18 +1,21 @@
 use anyhow::{anyhow, Result};
 use std::path::Path;
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
+use tracing::{debug, error, warn};
 use url::Url;
 use wasmtime::{component::*, Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi_http;
-use tracing::{debug, warn, error};
 
-use crate::plugins::*; // bindgen types (Media, Unit, Asset, MediaType, UnitKind, AssetKind, ProviderCapabilities)
-use crate::plugins::host::Host;
 use crate::plugins::config::PluginConfig;
-use tokio::runtime::Runtime;
+use crate::plugins::host::Host;
+use crate::plugins::*; // bindgen types (Media, Unit, Asset, MediaType, UnitKind, AssetKind, ProviderCapabilities)
 use std::sync::Arc as StdArc;
+use tokio::runtime::Runtime;
 
 #[allow(dead_code)] // Some fields retained for future lifecycle / metrics usage
 pub(crate) struct Plugin {
@@ -34,36 +37,79 @@ pub(crate) struct Plugin {
 }
 
 impl Plugin {
-    pub async fn new_async(engine: &Engine, plugin_path: &Path, epoch_ticks: Arc<AtomicU64>, epoch_interval: Duration, rt: StdArc<Runtime>) -> Result<Self> {
-        let component = Component::from_file(engine, plugin_path)?;
+    pub async fn new_async(
+        engine: &Engine,
+        plugin_path: &Path,
+        epoch_ticks: Arc<AtomicU64>,
+        epoch_interval: Duration,
+        rt: StdArc<Runtime>,
+    ) -> Result<Self> {
+        let component = if plugin_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("cwasm"))
+            .unwrap_or(false)
+        {
+            unsafe { Component::deserialize_file(engine, plugin_path)? }
+        } else {
+            Component::from_file(engine, plugin_path)?
+        };
         let cfg_path = plugin_path.with_extension("toml");
         let cfg: PluginConfig = std::fs::read_to_string(&cfg_path)
             .ok()
             .and_then(|s| toml::from_str(&s).ok())
             .unwrap_or_default();
-        let allowed_hosts: Option<Vec<String>> = cfg.allowed_hosts.as_ref().map(|v|
-            v.iter().map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()
-        );
+        let allowed_hosts: Option<Vec<String>> = cfg.allowed_hosts.as_ref().map(|v| {
+            v.iter()
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect()
+        });
         let mut builder = WasiCtxBuilder::new();
         builder.inherit_stdout().inherit_stderr().inherit_env();
-        if let Some(list) = &allowed_hosts { builder.env("TOURING_ALLOWED_HOSTS", list.join(",")); }
+        if let Some(list) = &allowed_hosts {
+            builder.env("TOURING_ALLOWED_HOSTS", list.join(","));
+        }
         let wasi = builder.build();
-    let http = wasmtime_wasi_http::WasiHttpCtx::new();
-    let host = Host { wasi, table: wasmtime_wasi::ResourceTable::new(), http };
+        let http = wasmtime_wasi_http::WasiHttpCtx::new();
+        let host = Host {
+            wasi,
+            table: wasmtime_wasi::ResourceTable::new(),
+            http,
+        };
         let mut store = Store::new(engine, host);
         let now = epoch_ticks.load(Ordering::Relaxed);
         let far = now.saturating_add(1_000_000_000);
         store.set_epoch_deadline(far);
         let mut linker = Linker::<Host>::new(engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
-    wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
-    // (If sockets support was required explicitly it would be added here; current API couples http to sockets internally when NetworkCtx present.)
-    let instance = linker.instantiate_async(&mut store, &component).await?;
-    let bindings = Library::new(&mut store, &instance)?;
+        wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+        // (If sockets support was required explicitly it would be added here; current API couples http to sockets internally when NetworkCtx present.)
+        let instance = linker.instantiate_async(&mut store, &component).await?;
+        let bindings = Library::new(&mut store, &instance)?;
         // Defer initial getcapabilities call until explicitly requested to avoid synchronous call on async-enabled engine
         let caps = None;
-    // Use a multi-thread runtime so async HTTP tasks can execute even after moving the Plugin to a different thread.
-        Ok(Self { name: plugin_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown").to_string(), store, _bindings: bindings, caps, rate_limit: Duration::from_millis(cfg.rate_limit_ms.unwrap_or(150)), slow_warn: Duration::from_secs(5), call_timeout: Duration::from_millis(cfg.call_timeout_ms.unwrap_or(15_000)), last_call: None, epoch_ticks, epoch_interval, allowed_hosts, _instance: instance, _component: component, rt })
+        // Use a multi-thread runtime so async HTTP tasks can execute even after moving the Plugin to a different thread.
+        Ok(Self {
+            name: plugin_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            store,
+            _bindings: bindings,
+            caps,
+            rate_limit: Duration::from_millis(cfg.rate_limit_ms.unwrap_or(150)),
+            slow_warn: Duration::from_secs(5),
+            call_timeout: Duration::from_millis(cfg.call_timeout_ms.unwrap_or(15_000)),
+            last_call: None,
+            epoch_ticks,
+            epoch_interval,
+            allowed_hosts,
+            _instance: instance,
+            _component: component,
+            rt,
+        })
     }
     // Removed legacy synchronous constructor; async instantiation `new_async` is the only path now.
 
@@ -99,7 +145,9 @@ impl Plugin {
     }
 
     pub(crate) fn retry_once<T, F>(&mut self, mut f: F, op: &str) -> Result<T>
-    where F: FnMut(&mut Self) -> Result<T> {
+    where
+        F: FnMut(&mut Self) -> Result<T>,
+    {
         for attempt in 0..2 {
             self.set_deadline();
             let res = f(self);
@@ -121,27 +169,40 @@ impl Plugin {
         match &self.allowed_hosts {
             None => true,
             Some(list) => {
-                if list.is_empty() { return false; }
-                let Ok(parsed) = Url::parse(url) else { return false; };
-                match parsed.scheme() { "http" | "https" => {}, _ => return false }
-                let Some(host) = parsed.host_str() else { return false; };
+                if list.is_empty() {
+                    return false;
+                }
+                let Ok(parsed) = Url::parse(url) else {
+                    return false;
+                };
+                match parsed.scheme() {
+                    "http" | "https" => {}
+                    _ => return false,
+                }
+                let Some(host) = parsed.host_str() else {
+                    return false;
+                };
                 let host = host.to_ascii_lowercase();
                 list.iter().any(|allowed| {
                     let a = allowed.as_str();
                     if let Some(stripped) = a.strip_prefix("*.") {
                         host == stripped || host.ends_with(&format!(".{}", stripped))
-                    } else { host == a }
+                    } else {
+                        host == a
+                    }
                 })
             }
         }
     }
 
     pub(crate) fn fetch_media_list(&mut self, kind: MediaType, query: &str) -> Result<Vec<Media>> {
-        if matches!(&self.allowed_hosts, Some(v) if v.is_empty()) { return Ok(Vec::new()); }
+        if matches!(&self.allowed_hosts, Some(v) if v.is_empty()) {
+            return Ok(Vec::new());
+        }
         self.throttle();
         self.set_deadline();
         let start = Instant::now();
-    debug!(plugin=%self.name, ?kind, query, "fetch_media_list start");
+        debug!(plugin=%self.name, ?kind, query, "fetch_media_list start");
         let res = self.retry_once(|this| {
             // Try plain export name first, then prefixed variant
             let func = this._instance.get_func(&mut this.store, "fetchmedialist")
@@ -161,10 +222,15 @@ impl Plugin {
                 let mut filtered: Vec<Media> = Vec::with_capacity(v.len());
                 let mut suppressed = 0usize;
                 for m in v.into_iter() {
-                    if m.id == "error" || m.title.starts_with("HTTP Error:") { suppressed += 1; continue; }
+                    if m.id == "error" || m.title.starts_with("HTTP Error:") {
+                        suppressed += 1;
+                        continue;
+                    }
                     filtered.push(m);
                 }
-                if suppressed > 0 { debug!(plugin=%self.name, query, suppressed, "suppressed sentinel error entries"); }
+                if suppressed > 0 {
+                    debug!(plugin=%self.name, query, suppressed, "suppressed sentinel error entries");
+                }
                 filtered
             }
             Err(e) => {
@@ -174,14 +240,24 @@ impl Plugin {
         };
         debug!(plugin=%self.name, query, count=list.len(), "fetch_media_list done");
         for m in &mut list {
-            if let Some(u) = &m.url { if !self.url_allowed(u) { m.url = None; } }
-            if let Some(c) = &m.cover_url { if !self.url_allowed(c) { m.cover_url = None; } }
+            if let Some(u) = &m.url {
+                if !self.url_allowed(u) {
+                    m.url = None;
+                }
+            }
+            if let Some(c) = &m.cover_url {
+                if !self.url_allowed(c) {
+                    m.cover_url = None;
+                }
+            }
         }
         Ok(list)
     }
 
     pub(crate) fn fetch_units(&mut self, media_id: &str) -> Result<Vec<Unit>> {
-        if matches!(&self.allowed_hosts, Some(v) if v.is_empty()) { return Ok(Vec::new()); }
+        if matches!(&self.allowed_hosts, Some(v) if v.is_empty()) {
+            return Ok(Vec::new());
+        }
         self.throttle();
         self.set_deadline();
         let start = Instant::now();
@@ -204,12 +280,20 @@ impl Plugin {
                 Vec::new()
             }
         };
-        for u in &mut units { if let Some(uurl) = &u.url { if !self.url_allowed(uurl) { u.url = None; } } }
+        for u in &mut units {
+            if let Some(uurl) = &u.url {
+                if !self.url_allowed(uurl) {
+                    u.url = None;
+                }
+            }
+        }
         Ok(units)
     }
 
     pub(crate) fn fetch_assets(&mut self, unit_id: &str) -> Result<Vec<Asset>> {
-        if matches!(&self.allowed_hosts, Some(v) if v.is_empty()) { return Ok(Vec::new()); }
+        if matches!(&self.allowed_hosts, Some(v) if v.is_empty()) {
+            return Ok(Vec::new());
+        }
         self.throttle();
         self.set_deadline();
         let start = Instant::now();
@@ -232,7 +316,10 @@ impl Plugin {
                 Vec::new()
             }
         };
-        let filtered: Vec<Asset> = assets.into_iter().filter(|a| self.url_allowed(&a.url)).collect();
+        let filtered: Vec<Asset> = assets
+            .into_iter()
+            .filter(|a| self.url_allowed(&a.url))
+            .collect();
         Ok(filtered)
     }
 
@@ -252,13 +339,16 @@ impl Plugin {
         }, "getcapabilities");
         self.clear_deadline();
         self.warn_if_slow(start, "getcapabilities");
-        if let Ok(c) = &res { self.caps = Some(c.clone()); }
+        if let Ok(c) = &res {
+            self.caps = Some(c.clone());
+        }
         res
     }
 
     pub(crate) fn get_capabilities_cached(&mut self) -> Result<ProviderCapabilities> {
-        if let Some(c) = &self.caps { return Ok(c.clone()); }
+        if let Some(c) = &self.caps {
+            return Ok(c.clone());
+        }
         self.get_capabilities_refresh()
     }
 }
-

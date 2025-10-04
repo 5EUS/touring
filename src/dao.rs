@@ -11,12 +11,12 @@ pub struct SourceInsert {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeriesInsert {
     pub id: String,
-    pub kind: String,                // "manga" | "anime"
+    pub kind: String, // "manga" | "anime"
     pub title: String,
-    pub alt_titles: Option<String>,  // JSON array string
+    pub alt_titles: Option<String>, // JSON array string
     pub description: Option<String>,
     pub cover_url: Option<String>,
-    pub tags: Option<String>,        // JSON array string
+    pub tags: Option<String>, // JSON array string
     pub status: Option<String>,
 }
 
@@ -176,7 +176,11 @@ pub async fn upsert_episode(pool: &AnyPool, e: &EpisodeInsert) -> Result<()> {
     Ok(())
 }
 
-pub async fn upsert_streams(pool: &AnyPool, episode_id: &str, streams: &[StreamInsert]) -> Result<()> {
+pub async fn upsert_streams(
+    pool: &AnyPool,
+    episode_id: &str,
+    streams: &[StreamInsert],
+) -> Result<()> {
     let mut tx = pool.begin().await?;
     for s in streams {
         sqlx::query(
@@ -194,7 +198,11 @@ pub async fn upsert_streams(pool: &AnyPool, episode_id: &str, streams: &[StreamI
 }
 
 // New helpers for canonical identity
-pub async fn find_series_id_by_source_external(pool: &AnyPool, source_id: &str, external_id: &str) -> Result<Option<String>> {
+pub async fn find_series_id_by_source_external(
+    pool: &AnyPool,
+    source_id: &str,
+    external_id: &str,
+) -> Result<Option<String>> {
     let id = sqlx::query_scalar::<_, String>(
         "SELECT series_id FROM series_sources WHERE source_id = ? AND external_id = ? LIMIT 1",
     )
@@ -205,7 +213,12 @@ pub async fn find_series_id_by_source_external(pool: &AnyPool, source_id: &str, 
     Ok(id)
 }
 
-pub async fn find_chapter_id_by_mapping(pool: &AnyPool, series_id: &str, source_id: &str, external_id: &str) -> Result<Option<String>> {
+pub async fn find_chapter_id_by_mapping(
+    pool: &AnyPool,
+    series_id: &str,
+    source_id: &str,
+    external_id: &str,
+) -> Result<Option<String>> {
     let id = sqlx::query_scalar::<_, String>(
         "SELECT id FROM chapters WHERE series_id = ? AND source_id = ? AND external_id = ? LIMIT 1",
     )
@@ -217,7 +230,12 @@ pub async fn find_chapter_id_by_mapping(pool: &AnyPool, series_id: &str, source_
     Ok(id)
 }
 
-pub async fn find_episode_id_by_mapping(pool: &AnyPool, series_id: &str, source_id: &str, external_id: &str) -> Result<Option<String>> {
+pub async fn find_episode_id_by_mapping(
+    pool: &AnyPool,
+    series_id: &str,
+    source_id: &str,
+    external_id: &str,
+) -> Result<Option<String>> {
     let id = sqlx::query_scalar::<_, String>(
         "SELECT id FROM episodes WHERE series_id = ? AND source_id = ? AND external_id = ? LIMIT 1",
     )
@@ -230,7 +248,11 @@ pub async fn find_episode_id_by_mapping(pool: &AnyPool, series_id: &str, source_
 }
 
 // New: Resolve episode id without requiring series_id (best-effort)
-pub async fn find_episode_id_by_source_external(pool: &AnyPool, source_id: &str, external_id: &str) -> Result<Option<String>> {
+pub async fn find_episode_id_by_source_external(
+    pool: &AnyPool,
+    source_id: &str,
+    external_id: &str,
+) -> Result<Option<String>> {
     let id = sqlx::query_scalar::<_, String>(
         "SELECT id FROM episodes WHERE source_id = ? AND external_id = ? LIMIT 1",
     )
@@ -253,12 +275,22 @@ pub async fn get_series_pref(pool: &AnyPool, series_id: &str) -> Result<Option<S
 
     match opt {
         None => Ok(None),
-        Some(s) if s.is_empty() => Ok(Some(SeriesPref { series_id: series_id.to_string(), download_path: None })),
-        Some(s) => Ok(Some(SeriesPref { series_id: series_id.to_string(), download_path: Some(s) })),
+        Some(s) if s.is_empty() => Ok(Some(SeriesPref {
+            series_id: series_id.to_string(),
+            download_path: None,
+        })),
+        Some(s) => Ok(Some(SeriesPref {
+            series_id: series_id.to_string(),
+            download_path: Some(s),
+        })),
     }
 }
 
-pub async fn set_series_download_path(pool: &AnyPool, series_id: &str, path: Option<&str>) -> Result<()> {
+pub async fn set_series_download_path(
+    pool: &AnyPool,
+    series_id: &str,
+    path: Option<&str>,
+) -> Result<()> {
     // Ensure the series exists to avoid FK violations and provide a clearer error
     let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM series WHERE id = ?")
         .bind(series_id)
@@ -280,34 +312,50 @@ pub async fn set_series_download_path(pool: &AnyPool, series_id: &str, path: Opt
 
 // Deletion helpers (cascade removes children where FK declared)
 pub async fn delete_series(pool: &AnyPool, series_id: &str) -> Result<u64> {
-    let res = sqlx::query("DELETE FROM series WHERE id = ?").bind(series_id).execute(pool).await?;
+    let res = sqlx::query("DELETE FROM series WHERE id = ?")
+        .bind(series_id)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected())
 }
 
 pub async fn delete_chapter(pool: &AnyPool, chapter_id: &str) -> Result<u64> {
-    let res = sqlx::query("DELETE FROM chapters WHERE id = ?").bind(chapter_id).execute(pool).await?;
+    let res = sqlx::query("DELETE FROM chapters WHERE id = ?")
+        .bind(chapter_id)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected())
 }
 
 pub async fn delete_episode(pool: &AnyPool, episode_id: &str) -> Result<u64> {
-    let res = sqlx::query("DELETE FROM episodes WHERE id = ?").bind(episode_id).execute(pool).await?;
+    let res = sqlx::query("DELETE FROM episodes WHERE id = ?")
+        .bind(episode_id)
+        .execute(pool)
+        .await?;
     Ok(res.rows_affected())
 }
 
 // Lookups to drive downloads/selection
 pub async fn list_series(pool: &AnyPool, kind: Option<&str>) -> Result<Vec<(String, String)>> {
     let rows = if let Some(k) = kind {
-        sqlx::query_as::<_, (String, String)>("SELECT id, title FROM series WHERE kind = ? ORDER BY title")
-            .bind(k)
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT id, title FROM series WHERE kind = ? ORDER BY title",
+        )
+        .bind(k)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, (String, String)>("SELECT id, title FROM series ORDER BY title")
             .fetch_all(pool)
             .await?
-    } else {
-        sqlx::query_as::<_, (String, String)>("SELECT id, title FROM series ORDER BY title").fetch_all(pool).await?
     };
     Ok(rows)
 }
 
-pub async fn list_chapters_for_series(pool: &AnyPool, series_id: &str) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
+pub async fn list_chapters_for_series(
+    pool: &AnyPool,
+    series_id: &str,
+) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
     let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>)>(
         "SELECT id, number_num, number_text FROM chapters WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
     )
@@ -317,7 +365,10 @@ pub async fn list_chapters_for_series(pool: &AnyPool, series_id: &str) -> Result
     Ok(rows)
 }
 
-pub async fn list_episodes_for_series(pool: &AnyPool, series_id: &str) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
+pub async fn list_episodes_for_series(
+    pool: &AnyPool,
+    series_id: &str,
+) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
     let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>)>(
         "SELECT id, number_num, number_text FROM episodes WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
     )

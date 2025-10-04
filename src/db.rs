@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use sqlx::{any::AnyConnectOptions, AnyPool, ConnectOptions, migrate::Migrator};
 use sqlx::any::AnyPoolOptions;
-use std::{path::PathBuf, str::FromStr};
+use sqlx::{any::AnyConnectOptions, migrate::Migrator, AnyPool, ConnectOptions};
 use std::sync::Once;
+use std::{path::PathBuf, str::FromStr};
 
 use crate::storage::Storage;
 
@@ -54,29 +54,33 @@ impl Database {
 
     pub async fn run_migrations(&self) -> Result<()> {
         // Quick check: if _sqlx_migrations table exists and has entries, skip
-        let check: Result<i64, _> = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM _sqlx_migrations"
-        )
-        .fetch_one(&self.pool)
-        .await;
-        
+        let check: Result<i64, _> = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&self.pool)
+            .await;
+
         // If table exists and has migrations, assume we're good (fast path)
         if let Ok(count) = check {
             if count > 0 {
                 return Ok(());
             }
         }
-        
+
         // Otherwise run migrations
         match MIGRATOR.run(&self.pool).await {
             Ok(_) => Ok(()),
             Err(e) => {
                 let msg = e.to_string();
                 let looks_modified = msg.contains("was previously applied but has been modified");
-                let duplicate_version = msg.contains("UNIQUE constraint failed: _sqlx_migrations.version");
+                let duplicate_version =
+                    msg.contains("UNIQUE constraint failed: _sqlx_migrations.version");
                 if looks_modified || duplicate_version {
-                    let _ = sqlx::query("DELETE FROM _sqlx_migrations").execute(&self.pool).await;
-                    MIGRATOR.run(&self.pool).await.context("running migrations after ledger reset")
+                    let _ = sqlx::query("DELETE FROM _sqlx_migrations")
+                        .execute(&self.pool)
+                        .await;
+                    MIGRATOR
+                        .run(&self.pool)
+                        .await
+                        .context("running migrations after ledger reset")
                 } else {
                     Err(e).context("running migrations")
                 }
@@ -84,7 +88,9 @@ impl Database {
         }
     }
 
-    pub fn pool(&self) -> &AnyPool { &self.pool }
+    pub fn pool(&self) -> &AnyPool {
+        &self.pool
+    }
 
     pub async fn clear_cache_prefix(&self, prefix: Option<&str>) -> Result<u64> {
         let result = if let Some(p) = prefix {
@@ -138,12 +144,14 @@ fn default_sqlite_url() -> Result<String> {
     let proj = ProjectDirs::from("dev", "touring", "touring")
         .context("unable to determine data directory for default sqlite path")?;
     let mut path: PathBuf = proj.data_dir().to_path_buf();
-    std::fs::create_dir_all(&path).with_context(|| format!("creating data dir: {}", path.display()))?;
+    std::fs::create_dir_all(&path)
+        .with_context(|| format!("creating data dir: {}", path.display()))?;
     path.push("touring.db");
 
     // Ensure parent directory exists (double safety)
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating db parent dir: {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating db parent dir: {}", parent.display()))?;
     }
 
     // Ensure the file exists so SQLite can open it in rw mode
@@ -154,6 +162,8 @@ fn default_sqlite_url() -> Result<String> {
 
     // Encode spaces in the path for a valid sqlite URL
     let mut path_str = path.to_string_lossy().to_string();
-    if path_str.contains(' ') { path_str = path_str.replace(' ', "%20"); }
+    if path_str.contains(' ') {
+        path_str = path_str.replace(' ', "%20");
+    }
     Ok(format!("sqlite:///{path_str}?mode=rwc"))
 }

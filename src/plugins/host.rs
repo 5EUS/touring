@@ -9,7 +9,7 @@ pub(crate) struct Host {
 }
 
 impl WasiView for Host {
-    fn ctx(&mut self) -> WasiCtxView<'_> { 
+    fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi,
             table: &mut self.table,
@@ -18,8 +18,12 @@ impl WasiView for Host {
 }
 
 impl WasiHttpView for Host {
-    fn ctx(&mut self) -> &mut WasiHttpCtx { &mut self.http }
-    fn table(&mut self) -> &mut wasmtime_wasi::ResourceTable { &mut self.table }
+    fn ctx(&mut self) -> &mut WasiHttpCtx {
+        &mut self.http
+    }
+    fn table(&mut self) -> &mut wasmtime_wasi::ResourceTable {
+        &mut self.table
+    }
 }
 
 // (No explicit sockets context; wasi-http handles networking internally in this preview.)

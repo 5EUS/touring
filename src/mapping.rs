@@ -1,4 +1,4 @@
-use crate::dao::{SeriesInsert, SeriesSourceInsert, ChapterInsert};
+use crate::dao::{ChapterInsert, SeriesInsert, SeriesSourceInsert};
 use crate::plugins::{Media, MediaType, Unit, UnitKind};
 
 fn kind_str(mt: &MediaType) -> &'static str {
@@ -10,11 +10,21 @@ fn kind_str(mt: &MediaType) -> &'static str {
 }
 
 pub fn series_id_from(source_id: &str, media: &Media) -> String {
-    format!("series:{}:{}:{}", source_id, kind_str(&media.mediatype), media.id)
+    format!(
+        "series:{}:{}:{}",
+        source_id,
+        kind_str(&media.mediatype),
+        media.id
+    )
 }
 
 pub fn chapter_id_from(source_id: &str, unit: &Unit) -> String {
-    let kind = match unit.kind { UnitKind::Chapter => "chapter", UnitKind::Episode => "episode", UnitKind::Section => "section", UnitKind::Other(_) => "unit" };
+    let kind = match unit.kind {
+        UnitKind::Chapter => "chapter",
+        UnitKind::Episode => "episode",
+        UnitKind::Section => "section",
+        UnitKind::Other(_) => "unit",
+    };
     format!("{}:{}:{}", source_id, kind, unit.id)
 }
 
@@ -31,11 +41,24 @@ pub fn series_insert_from_media(id: String, media: &Media) -> SeriesInsert {
     }
 }
 
-pub fn series_source_from(series_id: String, source_id: String, external_id: String) -> SeriesSourceInsert {
-    SeriesSourceInsert { series_id, source_id, external_id }
+pub fn series_source_from(
+    series_id: String,
+    source_id: String,
+    external_id: String,
+) -> SeriesSourceInsert {
+    SeriesSourceInsert {
+        series_id,
+        source_id,
+        external_id,
+    }
 }
 
-pub fn chapter_insert_from_unit(id: String, series_id: String, source_id: String, u: &Unit) -> ChapterInsert {
+pub fn chapter_insert_from_unit(
+    id: String,
+    series_id: String,
+    source_id: String,
+    u: &Unit,
+) -> ChapterInsert {
     ChapterInsert {
         id,
         series_id,

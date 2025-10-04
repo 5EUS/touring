@@ -1,10 +1,15 @@
-use std::path::Path;
 use anyhow::{anyhow, Result};
-use wasmtime::{Engine, Config};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
-use std::sync::{Arc, atomic::{AtomicU64, AtomicBool, Ordering}};
-use tracing::{debug, warn, error};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task;
+use tracing::{debug, error, warn};
+use wasmtime::{Config, Engine};
 
 // Generate WIT bindings from shared plugin-interface (generic library world)
 wasmtime::component::bindgen!({
@@ -12,32 +17,228 @@ wasmtime::component::bindgen!({
     path: "wit/",
 });
 
-mod host;
 mod config;
+mod host;
 mod plugin;
 
 use plugin::Plugin;
 
 // Commands routed to a dedicated worker thread per plugin
 enum PluginCmd {
-    FetchMediaList { kind: MediaType, query: String, reply: oneshot::Sender<anyhow::Result<Vec<Media>>> },
-    FetchUnits { media_id: String, reply: oneshot::Sender<anyhow::Result<Vec<Unit>>> },
-    FetchAssets { unit_id: String, reply: oneshot::Sender<anyhow::Result<Vec<Asset>>> },
-    GetCapabilities { refresh: bool, reply: oneshot::Sender<anyhow::Result<ProviderCapabilities>> },
-    GetAllowedHosts { reply: oneshot::Sender<anyhow::Result<Vec<String>>> },
+    FetchMediaList {
+        kind: MediaType,
+        query: String,
+        reply: oneshot::Sender<anyhow::Result<Vec<Media>>>,
+    },
+    FetchUnits {
+        media_id: String,
+        reply: oneshot::Sender<anyhow::Result<Vec<Unit>>>,
+    },
+    FetchAssets {
+        unit_id: String,
+        reply: oneshot::Sender<anyhow::Result<Vec<Asset>>>,
+    },
+    GetCapabilities {
+        refresh: bool,
+        reply: oneshot::Sender<anyhow::Result<ProviderCapabilities>>,
+    },
+    GetAllowedHosts {
+        reply: oneshot::Sender<anyhow::Result<Vec<String>>>,
+    },
 }
 
+#[derive(Clone)]
 struct PluginWorker {
-    name: String,
     tx: mpsc::Sender<PluginCmd>,
     call_timeout: Duration,
+}
+
+struct PluginArtifacts {
+    primary: PathBuf,
+    fallback: Option<PathBuf>,
+}
+
+struct PluginSlot {
+    name: String,
+    artifacts: PluginArtifacts,
+    engine: Arc<Engine>,
+    epoch_ticks: Arc<AtomicU64>,
+    epoch_interval: Duration,
+    state: Mutex<Option<PluginWorker>>,
+}
+
+#[derive(Default)]
+struct ArtifactSet {
+    wasm: Option<PathBuf>,
+    cwasm: Option<PathBuf>,
+}
+
+impl ArtifactSet {
+    fn into_artifacts(self, prefer_precompiled: bool) -> Option<PluginArtifacts> {
+        match (self.cwasm, self.wasm, prefer_precompiled) {
+            (Some(cwasm), Some(wasm), true) => Some(PluginArtifacts {
+                primary: cwasm,
+                fallback: Some(wasm),
+            }),
+            (Some(cwasm), Some(wasm), false) => Some(PluginArtifacts {
+                primary: wasm,
+                fallback: Some(cwasm),
+            }),
+            (Some(cwasm), None, _) => Some(PluginArtifacts {
+                primary: cwasm,
+                fallback: None,
+            }),
+            (None, Some(wasm), _) => Some(PluginArtifacts {
+                primary: wasm,
+                fallback: None,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl PluginSlot {
+    fn new(
+        name: String,
+        artifacts: PluginArtifacts,
+        engine: Arc<Engine>,
+        epoch_ticks: Arc<AtomicU64>,
+        epoch_interval: Duration,
+    ) -> Self {
+        Self {
+            name,
+            artifacts,
+            engine,
+            epoch_ticks,
+            epoch_interval,
+            state: Mutex::new(None),
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn worker(&self) -> Result<PluginWorker> {
+        let mut guard = self.state.lock().await;
+        if let Some(worker) = guard.as_ref() {
+            return Ok(worker.clone());
+        }
+
+        let primary_path = self.artifacts.primary.clone();
+        match self.instantiate(&primary_path).await {
+            Ok(worker) => {
+                *guard = Some(worker.clone());
+                return Ok(worker);
+            }
+            Err(mut err) => {
+                let msg = err.to_string();
+                warn!(plugin=%self.name, path=%primary_path.display(), error=%msg, "failed to load plugin artifact");
+                if let Some(fallback_path) = &self.artifacts.fallback {
+                    warn!(plugin=%self.name, path=%fallback_path.display(), "attempting fallback artifact");
+                    match self.instantiate(fallback_path).await {
+                        Ok(worker) => {
+                            *guard = Some(worker.clone());
+                            return Ok(worker);
+                        }
+                        Err(fallback_err) => {
+                            let fb_msg = fallback_err.to_string();
+                            error!(plugin=%self.name, path=%fallback_path.display(), error=%fb_msg, "fallback plugin load failed");
+                            err = fallback_err;
+                        }
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn instantiate(&self, path: &Path) -> Result<PluginWorker> {
+        let path_buf = path.to_path_buf();
+        if !path_buf.exists() {
+            return Err(anyhow!("plugin artifact missing: {}", path_buf.display()));
+        }
+        let cfg_path = path_buf.with_extension("toml");
+        if !cfg_path.exists() {
+            return Err(anyhow!("missing plugin config: {}", cfg_path.display()));
+        }
+
+        let slot_name = self.name.clone();
+        let engine = self.engine.clone();
+        let epoch_ticks = self.epoch_ticks.clone();
+        let interval = self.epoch_interval;
+        let path_to_load = path_buf.clone();
+
+        let plugin = task::spawn_blocking(move || -> Result<Plugin> {
+            let worker_threads = if cfg!(target_os = "ios") || cfg!(target_os = "android") {
+                1
+            } else {
+                2
+            };
+            let rt_arc = std::sync::Arc::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .worker_threads(worker_threads)
+                    .build()?,
+            );
+            let fut = Plugin::new_async(
+                &engine,
+                &path_to_load,
+                epoch_ticks,
+                interval,
+                rt_arc.clone(),
+            );
+            rt_arc.block_on(fut)
+        })
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "failed to join plugin loader thread for {}: {}",
+                slot_name,
+                e
+            )
+        })??;
+
+        let call_timeout = plugin.call_timeout;
+        let (tx, mut rx) = mpsc::channel::<PluginCmd>(64);
+        std::thread::spawn(move || {
+            let mut plugin = plugin;
+            while let Some(cmd) = rx.blocking_recv() {
+                match cmd {
+                    PluginCmd::FetchMediaList { kind, query, reply } => {
+                        let _ = reply.send(plugin.fetch_media_list(kind, &query));
+                    }
+                    PluginCmd::FetchUnits { media_id, reply } => {
+                        let _ = reply.send(plugin.fetch_units(&media_id));
+                    }
+                    PluginCmd::FetchAssets { unit_id, reply } => {
+                        let _ = reply.send(plugin.fetch_assets(&unit_id));
+                    }
+                    PluginCmd::GetCapabilities { refresh, reply } => {
+                        let res = if refresh {
+                            plugin.get_capabilities_refresh()
+                        } else {
+                            plugin.get_capabilities_cached()
+                        };
+                        let _ = reply.send(res);
+                    }
+                    PluginCmd::GetAllowedHosts { reply } => {
+                        let hosts = plugin.allowed_hosts.clone().unwrap_or_default();
+                        let _ = reply.send(Ok(hosts));
+                    }
+                }
+            }
+        });
+        println!("Loaded plugin: {}", path_buf.display());
+        Ok(PluginWorker { tx, call_timeout })
+    }
 }
 
 // Simplified plugin manager - generic
 #[allow(dead_code)] // Some fields (_epoch_stop/_epoch_thread) reserved for future coordinated shutdown
 pub struct PluginManager {
     engine: Arc<Engine>,
-    workers: Vec<PluginWorker>,
+    slots: Vec<Arc<PluginSlot>>,
     epoch_ticks: Arc<AtomicU64>,
     epoch_interval: Duration,
     _epoch_stop: Arc<AtomicBool>,
@@ -51,8 +252,8 @@ impl PluginManager {
         // Enable async support for wasi-http operations
         config.async_support(true);
         config.epoch_interruption(true);
-        
-        config.strategy(wasmtime::Strategy::Cranelift);
+
+        // config.strategy(wasmtime::Strategy::Cranelift);
         let engine = Arc::new(Engine::new(&config)?);
 
         // Start epoch ticker (10ms)
@@ -65,100 +266,116 @@ impl PluginManager {
         let handle = std::thread::spawn(move || {
             ticks.store(1, Ordering::Relaxed);
             loop {
-                if stop.load(Ordering::Relaxed) { break; }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
                 std::thread::sleep(epoch_interval);
                 eng.increment_epoch();
                 ticks.fetch_add(1, Ordering::Relaxed);
             }
         });
 
-        Ok(Self { engine, workers: Vec::new(), epoch_ticks, epoch_interval, _epoch_stop: epoch_stop, _epoch_thread: Some(handle) })
-    }
-
-    pub async fn load_plugin(&mut self, plugin_path: &Path) -> Result<()> {
-        let path = plugin_path.to_path_buf();
-        debug!(plugin_path=%path.display(), "instantiating plugin");
-        let engine = self.engine.clone();
-        let epoch_ticks = self.epoch_ticks.clone();
-        let interval = self.epoch_interval;
-        // Instantiate plugin (async)
-        // Use a small multi-thread runtime per plugin only for its internal async host calls
-        // On mobile, use 1 worker thread to reduce overhead; desktop uses 2
-        let worker_threads = if cfg!(target_os = "ios") || cfg!(target_os = "android") {
-            1
-        } else {
-            2
-        };
-        let rt_arc = std::sync::Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(worker_threads)
-                .build()?
-        );
-        // Instantiate plugin using current async context
-        let plugin = Plugin::new_async(&engine, &path, epoch_ticks, interval, rt_arc.clone()).await?;
-        let name = plugin.name.clone();
-        let call_timeout = plugin.call_timeout;
-        // Channel capacity small; backpressure signals overload
-        let (tx, mut rx) = mpsc::channel::<PluginCmd>(64);
-        // Move plugin into an OS thread hosting its single-thread runtime local executor
-        std::thread::spawn(move || {
-            // Reuse the same runtime for invoking async Wasm calls inside plugin methods
-            let mut plugin = plugin;
-            // Process messages sequentially
-            while let Some(cmd) = rx.blocking_recv() { // blocking_recv since we are already on a dedicated thread
-                match cmd {
-                    PluginCmd::FetchMediaList { kind, query, reply } => { let _ = reply.send(plugin.fetch_media_list(kind, &query)); }
-                    PluginCmd::FetchUnits { media_id, reply } => { let _ = reply.send(plugin.fetch_units(&media_id)); }
-                    PluginCmd::FetchAssets { unit_id, reply } => { let _ = reply.send(plugin.fetch_assets(&unit_id)); }
-                    PluginCmd::GetCapabilities { refresh, reply } => { let res = if refresh { plugin.get_capabilities_refresh() } else { plugin.get_capabilities_cached() }; let _ = reply.send(res); }
-                    PluginCmd::GetAllowedHosts { reply } => { let hosts = plugin.allowed_hosts.clone().unwrap_or_default(); let _ = reply.send(Ok(hosts)); }
-                }
-            }
-        });
-        self.workers.push(PluginWorker { name: name.clone(), tx, call_timeout });
-        println!("Loaded plugin: {}", plugin_path.display());
-        Ok(())
+        Ok(Self {
+            engine,
+            slots: Vec::new(),
+            epoch_ticks,
+            epoch_interval,
+            _epoch_stop: epoch_stop,
+            _epoch_thread: Some(handle),
+        })
     }
 
     pub async fn load_plugins_from_directory(&mut self, dir: &Path) -> Result<()> {
+        self.slots.clear();
         if !dir.exists() {
             println!("Plugin directory does not exist: {}", dir.display());
             return Ok(());
         }
+        let prefer_precompiled = cfg!(all(not(target_os = "ios"), not(target_os = "android")));
+        let mut artifacts_by_name: HashMap<String, ArtifactSet> = HashMap::new();
+
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("wasm") {
-                // Check if corresponding .toml file exists
-                let toml_path = path.with_extension("toml");
-                if !toml_path.exists() {
-                    warn!(plugin_path=%path.display(), "rejecting plugin: missing .toml config");
-                    continue;
-                }
-                
-                if let Err(e) = self.load_plugin(&path).await {
-                    error!(plugin_path=%path.display(), error=%e, "failed to load plugin");
-                }
+            let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let entry = artifacts_by_name.entry(stem.to_string()).or_default();
+            match ext {
+                "cwasm" => entry.cwasm = Some(path),
+                "wasm" => entry.wasm = Some(path),
+                _ => {}
             }
         }
+
+        for (name, artifact_set) in artifacts_by_name {
+            let Some(artifacts) = artifact_set.into_artifacts(prefer_precompiled) else {
+                warn!(plugin=%name, "skipping plugin - no valid artifacts found");
+                continue;
+            };
+            let cfg_path = artifacts.primary.with_extension("toml");
+            if !cfg_path.exists() {
+                warn!(plugin=%name, config=%cfg_path.display(), "rejecting plugin: missing .toml config");
+                continue;
+            }
+            let slot = PluginSlot::new(
+                name.clone(),
+                artifacts,
+                self.engine.clone(),
+                self.epoch_ticks.clone(),
+                self.epoch_interval,
+            );
+            debug!(plugin=%name, "registered plugin for lazy loading");
+            self.slots.push(Arc::new(slot));
+        }
+
+        self.slots.sort_by(|a, b| a.name().cmp(b.name()));
         Ok(())
     }
 
     pub fn list_plugins(&self) -> Vec<String> {
-        self.workers.iter().map(|w| w.name.clone()).collect()
+        self.slots
+            .iter()
+            .map(|slot| slot.name().to_string())
+            .collect()
     }
 
-    pub async fn get_capabilities(&self, refresh: bool) -> Result<Vec<(String, ProviderCapabilities)>> {
+    pub async fn get_capabilities(
+        &self,
+        refresh: bool,
+    ) -> Result<Vec<(String, ProviderCapabilities)>> {
         let mut out = Vec::new();
-        for w in &self.workers {
+        for slot_arc in &self.slots {
+            let slot = slot_arc.clone();
+            let worker = match slot.worker().await {
+                Ok(worker) => worker,
+                Err(e) => {
+                    warn!(plugin=%slot.name(), error=%e, "failed to initialize plugin");
+                    continue;
+                }
+            };
+            let name = slot.name().to_string();
+            let call_timeout = worker.call_timeout;
+            let tx = worker.tx.clone();
             let (reply_tx, reply_rx) = oneshot::channel();
-            if let Err(e) = w.tx.send(PluginCmd::GetCapabilities { refresh, reply: reply_tx }).await { warn!(plugin=%w.name, error=%e, "send error get_capabilities"); continue; }
-            match tokio::time::timeout(w.call_timeout, reply_rx).await {
-                Ok(Ok(Ok(c))) => out.push((w.name.clone(), c)),
-                Ok(Ok(Err(e))) => warn!(plugin=%w.name, error=%e, "get_capabilities failed"),
-                Ok(Err(_canceled)) => warn!(plugin=%w.name, "get_capabilities sender dropped"),
-                Err(_elapsed) => warn!(plugin=%w.name, "get_capabilities timeout"),
+            if let Err(e) = tx
+                .send(PluginCmd::GetCapabilities {
+                    refresh,
+                    reply: reply_tx,
+                })
+                .await
+            {
+                warn!(plugin=%name, error=%e, "send error get_capabilities");
+                continue;
+            }
+            match tokio::time::timeout(call_timeout, reply_rx).await {
+                Ok(Ok(Ok(c))) => out.push((name.clone(), c)),
+                Ok(Ok(Err(e))) => warn!(plugin=%name, error=%e, "get_capabilities failed"),
+                Ok(Err(_canceled)) => warn!(plugin=%name, "get_capabilities sender dropped"),
+                Err(_elapsed) => warn!(plugin=%name, "get_capabilities timeout"),
             }
         }
         Ok(out)
@@ -166,14 +383,31 @@ impl PluginManager {
 
     pub async fn get_allowed_hosts(&self) -> Result<Vec<(String, Vec<String>)>> {
         let mut out = Vec::new();
-        for w in &self.workers {
+        for slot_arc in &self.slots {
+            let slot = slot_arc.clone();
+            let worker = match slot.worker().await {
+                Ok(worker) => worker,
+                Err(e) => {
+                    warn!(plugin=%slot.name(), error=%e, "failed to initialize plugin");
+                    continue;
+                }
+            };
+            let name = slot.name().to_string();
+            let call_timeout = worker.call_timeout;
+            let tx = worker.tx.clone();
             let (reply_tx, reply_rx) = oneshot::channel();
-            if let Err(e) = w.tx.send(PluginCmd::GetAllowedHosts { reply: reply_tx }).await { warn!(plugin=%w.name, error=%e, "send error get_allowed_hosts"); continue; }
-            match tokio::time::timeout(w.call_timeout, reply_rx).await {
-                Ok(Ok(Ok(hosts))) => out.push((w.name.clone(), hosts)),
-                Ok(Ok(Err(e))) => warn!(plugin=%w.name, error=%e, "get_allowed_hosts failed"),
-                Ok(Err(_)) => warn!(plugin=%w.name, "get_allowed_hosts sender dropped"),
-                Err(_) => warn!(plugin=%w.name, "get_allowed_hosts timeout"),
+            if let Err(e) = tx
+                .send(PluginCmd::GetAllowedHosts { reply: reply_tx })
+                .await
+            {
+                warn!(plugin=%name, error=%e, "send error get_allowed_hosts");
+                continue;
+            }
+            match tokio::time::timeout(call_timeout, reply_rx).await {
+                Ok(Ok(Ok(hosts))) => out.push((name.clone(), hosts)),
+                Ok(Ok(Err(e))) => warn!(plugin=%name, error=%e, "get_allowed_hosts failed"),
+                Ok(Err(_)) => warn!(plugin=%name, "get_allowed_hosts sender dropped"),
+                Err(_) => warn!(plugin=%name, "get_allowed_hosts timeout"),
             }
         }
         Ok(out)
@@ -196,109 +430,281 @@ impl PluginManager {
     }
 
     // Generic internal helpers ------------------------------------------------------
-    async fn search_with_sources(&self, kind: MediaType, query: &str) -> Result<Vec<(String, Media)>> {
+    async fn search_with_sources(
+        &self,
+        kind: MediaType,
+        query: &str,
+    ) -> Result<Vec<(String, Media)>> {
         let mut futures = Vec::new();
-        for w in &self.workers {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            if let Err(e) = w.tx.send(PluginCmd::FetchMediaList { kind: kind.clone(), query: query.to_string(), reply: reply_tx }).await {
-                warn!(plugin=%w.name, error=%e, kind=?kind, "send error search_with_sources");
-                continue;
-            }
-            let name = w.name.clone();
-            let timeout = w.call_timeout;
+        for slot_arc in &self.slots {
+            let slot = slot_arc.clone();
+            let kind_clone = kind.clone();
+            let query_string = query.to_string();
             futures.push(async move {
-                match tokio::time::timeout(timeout, reply_rx).await {
+                let worker = match slot.worker().await {
+                    Ok(worker) => worker,
+                    Err(e) => {
+                        warn!(plugin=%slot.name(), error=%e, kind=?kind_clone, "failed to initialize plugin");
+                        return None;
+                    }
+                };
+                let name = slot.name().to_string();
+                let call_timeout = worker.call_timeout;
+                let tx = worker.tx.clone();
+                let (reply_tx, reply_rx) = oneshot::channel();
+                if let Err(e) =
+                    tx.send(PluginCmd::FetchMediaList {
+                        kind: kind_clone.clone(),
+                        query: query_string.clone(),
+                        reply: reply_tx,
+                    })
+                    .await
+                {
+                    warn!(plugin=%name, error=%e, kind=?kind_clone, "send error search_with_sources");
+                    return None;
+                }
+                match tokio::time::timeout(call_timeout, reply_rx).await {
                     Ok(Ok(Ok(list))) => Some((name, list)),
-                    Ok(Ok(Err(e))) => { warn!(plugin=%name, error=%e, "fetchmedialist failed"); None },
-                    Ok(Err(_)) => { warn!(plugin=%name, "fetchmedialist sender dropped"); None },
-                    Err(_) => { warn!(plugin=%name, "fetchmedialist timeout"); None },
+                    Ok(Ok(Err(e))) => {
+                        warn!(plugin=%name, error=%e, "fetchmedialist failed");
+                        None
+                    }
+                    Ok(Err(_)) => {
+                        warn!(plugin=%name, "fetchmedialist sender dropped");
+                        None
+                    }
+                    Err(_) => {
+                        warn!(plugin=%name, "fetchmedialist timeout");
+                        None
+                    }
                 }
             });
         }
         let mut all = Vec::new();
-        for r in futures::future::join_all(futures).await.into_iter().flatten() {
+        for r in futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+        {
             let (name, list) = r;
             debug!(plugin=%name, kind=?kind, query, count=list.len(), "search results");
-            for m in list { all.push((name.clone(), m)); }
+            for m in list {
+                all.push((name.clone(), m));
+            }
         }
         Ok(all)
     }
 
     async fn search_for(&self, kind: MediaType, source: &str, query: &str) -> Result<Vec<Media>> {
-        if let Some(w) = self.workers.iter().find(|w| w.name == source) {
+        if let Some(slot) = self
+            .slots
+            .iter()
+            .find(|slot| slot.name() == source)
+            .cloned()
+        {
+            let worker = slot
+                .worker()
+                .await
+                .map_err(|e| anyhow!("failed to initialize plugin {}: {}", source, e))?;
+            let call_timeout = worker.call_timeout;
+            let tx = worker.tx.clone();
             let (reply_tx, reply_rx) = oneshot::channel();
-            w.tx.send(PluginCmd::FetchMediaList { kind: kind.clone(), query: query.to_string(), reply: reply_tx }).await.map_err(|e| anyhow!("send error: {}", e))?;
-            match tokio::time::timeout(w.call_timeout, reply_rx).await {
-                Ok(Ok(Ok(v))) => { debug!(plugin=%source, kind=?kind, query, count=v.len(), "search_for results"); Ok(v) }
+            tx.send(PluginCmd::FetchMediaList {
+                kind: kind.clone(),
+                query: query.to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|e| anyhow!("send error: {}", e))?;
+            match tokio::time::timeout(call_timeout, reply_rx).await {
+                Ok(Ok(Ok(v))) => {
+                    debug!(plugin=%source, kind=?kind, query, count=v.len(), "search_for results");
+                    Ok(v)
+                }
                 Ok(Ok(Err(e))) => Err(anyhow!("{}", e)),
                 Ok(Err(_)) => Err(anyhow!("sender dropped")),
-                Err(_) => Err(anyhow!("timeout after {:?}", w.call_timeout)),
+                Err(_) => Err(anyhow!("timeout after {:?}", call_timeout)),
             }
-        } else { Ok(Vec::new()) }
+        } else {
+            Ok(Vec::new())
+        }
     }
-    pub async fn get_manga_chapters_with_source(&self, manga_id: &str) -> Result<(Option<String>, Vec<Unit>)> {
-        for w in &self.workers {
+    pub async fn get_manga_chapters_with_source(
+        &self,
+        manga_id: &str,
+    ) -> Result<(Option<String>, Vec<Unit>)> {
+        for slot_arc in &self.slots {
+            let slot = slot_arc.clone();
+            let worker = match slot.worker().await {
+                Ok(worker) => worker,
+                Err(e) => {
+                    warn!(plugin=%slot.name(), error=%e, "failed to initialize plugin");
+                    continue;
+                }
+            };
+            let name = slot.name().to_string();
+            let call_timeout = worker.call_timeout;
+            let tx = worker.tx.clone();
             let (reply_tx, reply_rx) = oneshot::channel();
-            if let Err(e) = w.tx.send(PluginCmd::FetchUnits { media_id: manga_id.to_string(), reply: reply_tx }).await { warn!(plugin=%w.name, error=%e, "send error get_manga_chapters_with_source"); continue; }
-            match tokio::time::timeout(w.call_timeout, reply_rx).await {
+            if let Err(e) = tx
+                .send(PluginCmd::FetchUnits {
+                    media_id: manga_id.to_string(),
+                    reply: reply_tx,
+                })
+                .await
+            {
+                warn!(plugin=%name, error=%e, "send error get_manga_chapters_with_source");
+                continue;
+            }
+            match tokio::time::timeout(call_timeout, reply_rx).await {
                 Ok(Ok(Ok(units))) => {
-                    let chapters: Vec<Unit> = units.into_iter().filter(|u| matches!(u.kind, UnitKind::Chapter)).collect();
-                    if !chapters.is_empty() { return Ok((Some(w.name.clone()), chapters)); }
+                    let chapters: Vec<Unit> = units
+                        .into_iter()
+                        .filter(|u| matches!(u.kind, UnitKind::Chapter))
+                        .collect();
+                    if !chapters.is_empty() {
+                        return Ok((Some(name), chapters));
+                    }
                 }
-                Ok(Ok(Err(e))) => warn!(plugin=%w.name, error=%e, "fetchunits failed"),
-                Ok(Err(_)) => warn!(plugin=%w.name, "fetchunits sender dropped"),
-                Err(_) => warn!(plugin=%w.name, "fetchunits timeout"),
+                Ok(Ok(Err(e))) => warn!(plugin=%name, error=%e, "fetchunits failed"),
+                Ok(Err(_)) => warn!(plugin=%name, "fetchunits sender dropped"),
+                Err(_) => warn!(plugin=%name, "fetchunits timeout"),
             }
         }
         Ok((None, Vec::new()))
     }
 
-    pub async fn get_chapter_images_with_source(&self, chapter_id: &str) -> Result<(Option<String>, Vec<String>)> {
-        for w in &self.workers {
+    pub async fn get_chapter_images_with_source(
+        &self,
+        chapter_id: &str,
+    ) -> Result<(Option<String>, Vec<String>)> {
+        for slot_arc in &self.slots {
+            let slot = slot_arc.clone();
+            let worker = match slot.worker().await {
+                Ok(worker) => worker,
+                Err(e) => {
+                    warn!(plugin=%slot.name(), error=%e, "failed to initialize plugin");
+                    continue;
+                }
+            };
+            let name = slot.name().to_string();
+            let call_timeout = worker.call_timeout;
+            let tx = worker.tx.clone();
             let (reply_tx, reply_rx) = oneshot::channel();
-            if let Err(e) = w.tx.send(PluginCmd::FetchAssets { unit_id: chapter_id.to_string(), reply: reply_tx }).await { warn!(plugin=%w.name, error=%e, "send error get_chapter_images_with_source"); continue; }
-            match tokio::time::timeout(w.call_timeout, reply_rx).await {
+            if let Err(e) = tx
+                .send(PluginCmd::FetchAssets {
+                    unit_id: chapter_id.to_string(),
+                    reply: reply_tx,
+                })
+                .await
+            {
+                warn!(plugin=%name, error=%e, "send error get_chapter_images_with_source");
+                continue;
+            }
+            match tokio::time::timeout(call_timeout, reply_rx).await {
                 Ok(Ok(Ok(assets))) => {
-                    let urls: Vec<String> = assets.into_iter().filter(|a| matches!(a.kind, AssetKind::Page | AssetKind::Image)).map(|a| a.url).collect();
-                    if !urls.is_empty() { return Ok((Some(w.name.clone()), urls)); }
+                    let urls: Vec<String> = assets
+                        .into_iter()
+                        .filter(|a| matches!(a.kind, AssetKind::Page | AssetKind::Image))
+                        .map(|a| a.url)
+                        .collect();
+                    if !urls.is_empty() {
+                        return Ok((Some(name), urls));
+                    }
                 }
-                Ok(Ok(Err(e))) => warn!(plugin=%w.name, error=%e, "fetchassets failed"),
-                Ok(Err(_)) => warn!(plugin=%w.name, "fetchassets sender dropped"),
-                Err(_) => warn!(plugin=%w.name, "fetchassets timeout"),
+                Ok(Ok(Err(e))) => warn!(plugin=%name, error=%e, "fetchassets failed"),
+                Ok(Err(_)) => warn!(plugin=%name, "fetchassets sender dropped"),
+                Err(_) => warn!(plugin=%name, "fetchassets timeout"),
             }
         }
         Ok((None, Vec::new()))
     }
 
-    pub async fn get_anime_episodes_with_source(&self, anime_id: &str) -> Result<(Option<String>, Vec<Unit>)> {
-        for w in &self.workers {
+    pub async fn get_anime_episodes_with_source(
+        &self,
+        anime_id: &str,
+    ) -> Result<(Option<String>, Vec<Unit>)> {
+        for slot_arc in &self.slots {
+            let slot = slot_arc.clone();
+            let worker = match slot.worker().await {
+                Ok(worker) => worker,
+                Err(e) => {
+                    warn!(plugin=%slot.name(), error=%e, "failed to initialize plugin");
+                    continue;
+                }
+            };
+            let name = slot.name().to_string();
+            let call_timeout = worker.call_timeout;
+            let tx = worker.tx.clone();
             let (reply_tx, reply_rx) = oneshot::channel();
-            if let Err(e) = w.tx.send(PluginCmd::FetchUnits { media_id: anime_id.to_string(), reply: reply_tx }).await { warn!(plugin=%w.name, error=%e, "send error get_anime_episodes_with_source"); continue; }
-            match tokio::time::timeout(w.call_timeout, reply_rx).await {
+            if let Err(e) = tx
+                .send(PluginCmd::FetchUnits {
+                    media_id: anime_id.to_string(),
+                    reply: reply_tx,
+                })
+                .await
+            {
+                warn!(plugin=%name, error=%e, "send error get_anime_episodes_with_source");
+                continue;
+            }
+            match tokio::time::timeout(call_timeout, reply_rx).await {
                 Ok(Ok(Ok(units))) => {
-                    let eps: Vec<Unit> = units.into_iter().filter(|u| matches!(u.kind, UnitKind::Episode)).collect();
-                    if !eps.is_empty() { return Ok((Some(w.name.clone()), eps)); }
+                    let eps: Vec<Unit> = units
+                        .into_iter()
+                        .filter(|u| matches!(u.kind, UnitKind::Episode))
+                        .collect();
+                    if !eps.is_empty() {
+                        return Ok((Some(name), eps));
+                    }
                 }
-                Ok(Ok(Err(e))) => warn!(plugin=%w.name, error=%e, "fetchunits failed"),
-                Ok(Err(_)) => warn!(plugin=%w.name, "fetchunits sender dropped"),
-                Err(_) => warn!(plugin=%w.name, "fetchunits timeout"),
+                Ok(Ok(Err(e))) => warn!(plugin=%name, error=%e, "fetchunits failed"),
+                Ok(Err(_)) => warn!(plugin=%name, "fetchunits sender dropped"),
+                Err(_) => warn!(plugin=%name, "fetchunits timeout"),
             }
         }
         Ok((None, Vec::new()))
     }
 
-    pub async fn get_episode_streams_with_source(&self, episode_id: &str) -> Result<(Option<String>, Vec<Asset>)> {
-        for w in &self.workers {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            if let Err(e) = w.tx.send(PluginCmd::FetchAssets { unit_id: episode_id.to_string(), reply: reply_tx }).await { warn!(plugin=%w.name, error=%e, "send error get_episode_streams_with_source"); continue; }
-            match tokio::time::timeout(w.call_timeout, reply_rx).await {
-                Ok(Ok(Ok(assets))) => {
-                    let vids: Vec<Asset> = assets.into_iter().filter(|a| matches!(a.kind, AssetKind::Video)).collect();
-                    if !vids.is_empty() { return Ok((Some(w.name.clone()), vids)); }
+    pub async fn get_episode_streams_with_source(
+        &self,
+        episode_id: &str,
+    ) -> Result<(Option<String>, Vec<Asset>)> {
+        for slot_arc in &self.slots {
+            let slot = slot_arc.clone();
+            let worker = match slot.worker().await {
+                Ok(worker) => worker,
+                Err(e) => {
+                    warn!(plugin=%slot.name(), error=%e, "failed to initialize plugin");
+                    continue;
                 }
-                Ok(Ok(Err(e))) => warn!(plugin=%w.name, error=%e, "fetchassets failed"),
-                Ok(Err(_)) => warn!(plugin=%w.name, "fetchassets sender dropped"),
-                Err(_) => warn!(plugin=%w.name, "fetchassets timeout"),
+            };
+            let name = slot.name().to_string();
+            let call_timeout = worker.call_timeout;
+            let tx = worker.tx.clone();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if let Err(e) = tx
+                .send(PluginCmd::FetchAssets {
+                    unit_id: episode_id.to_string(),
+                    reply: reply_tx,
+                })
+                .await
+            {
+                warn!(plugin=%name, error=%e, "send error get_episode_streams_with_source");
+                continue;
+            }
+            match tokio::time::timeout(call_timeout, reply_rx).await {
+                Ok(Ok(Ok(assets))) => {
+                    let vids: Vec<Asset> = assets
+                        .into_iter()
+                        .filter(|a| matches!(a.kind, AssetKind::Video))
+                        .collect();
+                    if !vids.is_empty() {
+                        return Ok((Some(name), vids));
+                    }
+                }
+                Ok(Ok(Err(e))) => warn!(plugin=%name, error=%e, "fetchassets failed"),
+                Ok(Err(_)) => warn!(plugin=%name, "fetchassets sender dropped"),
+                Err(_) => warn!(plugin=%name, "fetchassets timeout"),
             }
         }
         Ok((None, Vec::new()))
@@ -309,6 +715,8 @@ impl PluginManager {
 impl Drop for PluginManager {
     fn drop(&mut self) {
         self._epoch_stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self._epoch_thread.take() { let _ = handle.join(); }
+        if let Some(handle) = self._epoch_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
