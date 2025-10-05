@@ -363,7 +363,14 @@ impl Aggregator {
         chapter_id: &str,
         refresh: bool,
     ) -> Result<Vec<String>> {
-        let key = format!("all|pages|{}", chapter_id);
+        let pool = self.db.pool().clone();
+        let fetch_info = dao::find_chapter_fetch_info(&pool, chapter_id).await?;
+        let (cache_id, fetch_id) = match fetch_info {
+            Some((canonical_id, _source_id, external_id)) => (canonical_id, external_id),
+            None => (chapter_id.to_string(), chapter_id.to_string()),
+        };
+
+        let key = format!("all|pages|{}", cache_id);
         let now = current_epoch();
         if !refresh {
             if let Some(payload) = self.db.get_cache(&key, now).await.ok().flatten() {
@@ -372,7 +379,7 @@ impl Aggregator {
                 }
             }
         }
-        let (_src_opt, urls) = self.pm.get_chapter_images_with_source(chapter_id).await?;
+        let (_src_opt, urls) = self.pm.get_chapter_images_with_source(&fetch_id).await?;
         let payload = serde_json::to_string(&urls)?;
         let _ = self
             .db

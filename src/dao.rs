@@ -2,6 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::AnyPool;
 
+use crate::ChapterProgress;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceInsert {
     pub id: String,
@@ -261,6 +263,134 @@ pub async fn find_episode_id_by_source_external(
     .fetch_optional(pool)
     .await?;
     Ok(id)
+}
+
+pub async fn find_chapter_identity(
+    pool: &AnyPool,
+    chapter_id_or_external: &str,
+) -> Result<Option<(String, String)>> {
+    if let Some(row) = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, series_id FROM chapters WHERE id = ? LIMIT 1",
+    )
+    .bind(chapter_id_or_external)
+    .fetch_optional(pool)
+    .await?
+    {
+        return Ok(Some(row));
+    }
+
+    let row = sqlx::query_as::<_, (String, String)>(
+        "SELECT id, series_id FROM chapters WHERE external_id = ? LIMIT 1",
+    )
+    .bind(chapter_id_or_external)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn find_chapter_fetch_info(
+    pool: &AnyPool,
+    chapter_id_or_external: &str,
+) -> Result<Option<(String, String, String)>> {
+    if let Some(row) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT id, source_id, external_id FROM chapters WHERE id = ? LIMIT 1",
+    )
+    .bind(chapter_id_or_external)
+    .fetch_optional(pool)
+    .await?
+    {
+        return Ok(Some(row));
+    }
+
+    let row = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT id, source_id, external_id FROM chapters WHERE external_id = ? LIMIT 1",
+    )
+    .bind(chapter_id_or_external)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn upsert_chapter_progress(
+    pool: &AnyPool,
+    chapter_id: &str,
+    series_id: &str,
+    page_index: i64,
+    total_pages: Option<i64>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO chapter_progress(chapter_id, series_id, page_index, total_pages, updated_at)
+         VALUES(?, ?, ?, ?, unixepoch())
+         ON CONFLICT(chapter_id) DO UPDATE SET
+           series_id=excluded.series_id,
+           page_index=excluded.page_index,
+           total_pages=excluded.total_pages,
+           updated_at=unixepoch()",
+    )
+    .bind(chapter_id)
+    .bind(series_id)
+    .bind(page_index)
+    .bind(total_pages)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_chapter_progress(pool: &AnyPool, chapter_id: &str) -> Result<u64> {
+    let res = sqlx::query("DELETE FROM chapter_progress WHERE chapter_id = ?")
+        .bind(chapter_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn get_chapter_progress(
+    pool: &AnyPool,
+    chapter_id: &str,
+) -> Result<Option<ChapterProgress>> {
+    let row = sqlx::query_as::<_, (String, String, i64, Option<i64>, i64)>(
+        "SELECT chapter_id, series_id, page_index, total_pages, updated_at
+         FROM chapter_progress WHERE chapter_id = ? LIMIT 1",
+    )
+    .bind(chapter_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(
+        |(chapter_id, series_id, page_index, total_pages, updated_at)| ChapterProgress {
+            chapter_id,
+            series_id,
+            page_index,
+            total_pages,
+            updated_at,
+        },
+    ))
+}
+
+pub async fn get_chapter_progress_for_series(
+    pool: &AnyPool,
+    series_id: &str,
+) -> Result<Vec<ChapterProgress>> {
+    let rows = sqlx::query_as::<_, (String, String, i64, Option<i64>, i64)>(
+        "SELECT chapter_id, series_id, page_index, total_pages, updated_at
+         FROM chapter_progress WHERE series_id = ?",
+    )
+    .bind(series_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(chapter_id, series_id, page_index, total_pages, updated_at)| ChapterProgress {
+                chapter_id,
+                series_id,
+                page_index,
+                total_pages,
+                updated_at,
+            },
+        )
+        .collect())
 }
 
 // New: preferences

@@ -53,19 +53,6 @@ impl Database {
     }
 
     pub async fn run_migrations(&self) -> Result<()> {
-        // Quick check: if _sqlx_migrations table exists and has entries, skip
-        let check: Result<i64, _> = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations")
-            .fetch_one(&self.pool)
-            .await;
-
-        // If table exists and has migrations, assume we're good (fast path)
-        if let Ok(count) = check {
-            if count > 0 {
-                return Ok(());
-            }
-        }
-
-        // Otherwise run migrations
         match MIGRATOR.run(&self.pool).await {
             Ok(_) => Ok(()),
             Err(e) => {

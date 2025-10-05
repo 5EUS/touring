@@ -84,6 +84,15 @@ pub struct EpisodeInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChapterProgress {
+    pub chapter_id: String,
+    pub series_id: String,
+    pub page_index: i64,
+    pub total_pages: Option<i64>,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadProgress {
     pub current: usize,
     pub total: usize,
@@ -243,6 +252,57 @@ impl Touring {
     ) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
         let pool = self.agg.database().pool().clone();
         crate::dao::list_episodes_for_series(&pool, series_id).await
+    }
+
+    pub async fn get_chapter_progress(&self, chapter_id: &str) -> Result<Option<ChapterProgress>> {
+        let pool = self.agg.database().pool().clone();
+        if let Some((canonical_id, _series_id)) =
+            crate::dao::find_chapter_identity(&pool, chapter_id).await?
+        {
+            crate::dao::get_chapter_progress(&pool, &canonical_id).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn get_chapter_progress_for_series(
+        &self,
+        series_id: &str,
+    ) -> Result<Vec<ChapterProgress>> {
+        let pool = self.agg.database().pool().clone();
+        crate::dao::get_chapter_progress_for_series(&pool, series_id).await
+    }
+
+    pub async fn set_chapter_progress(
+        &self,
+        chapter_id: &str,
+        page_index: i64,
+        total_pages: Option<i64>,
+    ) -> Result<()> {
+        let pool = self.agg.database().pool().clone();
+        if let Some((canonical_id, series_id)) =
+            crate::dao::find_chapter_identity(&pool, chapter_id).await?
+        {
+            crate::dao::upsert_chapter_progress(
+                &pool,
+                &canonical_id,
+                &series_id,
+                page_index,
+                total_pages,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn clear_chapter_progress(&self, chapter_id: &str) -> Result<()> {
+        let pool = self.agg.database().pool().clone();
+        if let Some((canonical_id, _series_id)) =
+            crate::dao::find_chapter_identity(&pool, chapter_id).await?
+        {
+            let _ = crate::dao::clear_chapter_progress(&pool, &canonical_id).await?;
+        }
+        Ok(())
     }
 
     pub async fn get_series_download_path(&self, series_id: &str) -> Result<Option<String>> {
