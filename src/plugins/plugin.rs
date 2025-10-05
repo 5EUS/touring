@@ -52,7 +52,17 @@ impl Plugin {
         {
             unsafe { Component::deserialize_file(engine, plugin_path)? }
         } else {
-            Component::from_file(engine, plugin_path)?
+            #[cfg(target_os = "ios")]
+            {
+                return Err(anyhow!(
+                    "Pulley host requires precompiled .cwasm artifact; found {}",
+                    plugin_path.display()
+                ));
+            }
+            #[cfg(not(target_os = "ios"))]
+            {
+                Component::from_file(engine, plugin_path)?
+            }
         };
         let cfg_path = plugin_path.with_extension("toml");
         let cfg: PluginConfig = std::fs::read_to_string(&cfg_path)

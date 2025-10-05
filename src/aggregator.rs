@@ -258,6 +258,15 @@ impl Aggregator {
         Ok(units)
     }
 
+    /// Fetch chapters without mutating the database (used for previews in the UI)
+    pub async fn preview_manga_chapters(&self, external_manga_id: &str) -> Result<Vec<Unit>> {
+        let (_source_opt, units) = self
+            .pm
+            .get_manga_chapters_with_source(external_manga_id)
+            .await?;
+        Ok(units)
+    }
+
     pub async fn get_anime_episodes(&self, external_anime_id: &str) -> Result<Vec<Unit>> {
         let (source_opt, units) = self
             .pm
@@ -311,6 +320,15 @@ impl Aggregator {
                 }
             }
         }
+        Ok(units)
+    }
+
+    /// Fetch episodes without mutating the database (used for previews in the UI)
+    pub async fn preview_anime_episodes(&self, external_anime_id: &str) -> Result<Vec<Unit>> {
+        let (_source_opt, units) = self
+            .pm
+            .get_anime_episodes_with_source(external_anime_id)
+            .await?;
         Ok(units)
     }
 

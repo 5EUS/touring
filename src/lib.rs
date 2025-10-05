@@ -186,9 +186,19 @@ impl Touring {
         self.agg.get_manga_chapters(external_manga_id).await
     }
 
+    /// Fetch chapters without persisting them (used for preview flows)
+    pub async fn preview_manga_chapters(&self, external_manga_id: &str) -> Result<Vec<Unit>> {
+        self.agg.preview_manga_chapters(external_manga_id).await
+    }
+
     /// Fetch episode list for an anime id; upserts and returns episodes.
     pub async fn get_anime_episodes(&self, external_anime_id: &str) -> Result<Vec<Unit>> {
         self.agg.get_anime_episodes(external_anime_id).await
+    }
+
+    /// Fetch episodes without persisting them (used for preview flows)
+    pub async fn preview_anime_episodes(&self, external_anime_id: &str) -> Result<Vec<Unit>> {
+        self.agg.preview_anime_episodes(external_anime_id).await
     }
 
     /// Fetch episode streams for an episode id; persists streams (dedupe by (episode_id, url)).

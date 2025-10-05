@@ -162,7 +162,15 @@ source::export!(PluginSource with_types_in crate::source);
 cargo build --target wasm32-wasip2 --release
 ```
 
-5. Copy to plugins directory:
+5. Precompile for the target runtime when shipping to mobile. Touring's iOS
+    embedding runs Wasmtime's Pulley interpreter, so the `.cwasm` artifact must
+    be produced with the `pulley64` target:
+```bash
+wasmtime compile your_plugin.wasm --target pulley64 -o your_plugin.cwasm
+```
+    or use the provided Makefiles with `WASMTIME_TARGETS="pulley64 aarch64-apple-ios"`.
+
+6. Copy to plugins directory:
 ```bash
 cp target/wasm32-wasip2/release/my_plugin.wasm ../touring/plugins/
 ```

@@ -132,18 +132,16 @@ impl PluginSlot {
                 return Ok(worker);
             }
             Err(mut err) => {
-                let msg = err.to_string();
-                warn!(plugin=%self.name, path=%primary_path.display(), error=%msg, "failed to load plugin artifact");
+                warn!(plugin=%self.name, path=%primary_path.display(), error=?err, "failed to load plugin artifact");
                 if let Some(fallback_path) = &self.artifacts.fallback {
-                    warn!(plugin=%self.name, path=%fallback_path.display(), "attempting fallback artifact");
+                    warn!(plugin=%self.name, path=%fallback_path.display(), error=?err, "attempting fallback artifact");
                     match self.instantiate(fallback_path).await {
                         Ok(worker) => {
                             *guard = Some(worker.clone());
                             return Ok(worker);
                         }
                         Err(fallback_err) => {
-                            let fb_msg = fallback_err.to_string();
-                            error!(plugin=%self.name, path=%fallback_path.display(), error=%fb_msg, "fallback plugin load failed");
+                            error!(plugin=%self.name, path=%fallback_path.display(), error=?fallback_err, "fallback plugin load failed");
                             err = fallback_err;
                         }
                     }
@@ -248,12 +246,26 @@ pub struct PluginManager {
 impl PluginManager {
     pub fn new() -> Result<Self> {
         let mut config = Config::new();
+
         config.wasm_component_model(true);
         // Enable async support for wasi-http operations
         config.async_support(true);
         config.epoch_interruption(true);
 
-        // config.strategy(wasmtime::Strategy::Cranelift);
+        #[cfg(not(target_os = "ios"))]
+        {
+            use wasmtime::OptLevel;
+            config.strategy(wasmtime::Strategy::Cranelift);
+            config.cranelift_opt_level(OptLevel::Speed);
+        }
+        #[cfg(target_os = "ios")]
+        {
+            use wasmtime::Collector;
+            config.collector(Collector::DeferredReferenceCounting);
+            config
+                .target("pulley64")
+                .map_err(|e| anyhow!("failed to set Pulley target: {}", e))?;
+        }
         let engine = Arc::new(Engine::new(&config)?);
 
         // Start epoch ticker (10ms)
@@ -291,7 +303,7 @@ impl PluginManager {
             println!("Plugin directory does not exist: {}", dir.display());
             return Ok(());
         }
-        let prefer_precompiled = cfg!(all(not(target_os = "ios"), not(target_os = "android")));
+        let prefer_precompiled = !cfg!(target_os = "android");
         let mut artifacts_by_name: HashMap<String, ArtifactSet> = HashMap::new();
 
         for entry in std::fs::read_dir(dir)? {
