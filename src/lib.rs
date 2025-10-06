@@ -241,7 +241,7 @@ impl Touring {
     pub async fn list_chapters_for_series(
         &self,
         series_id: &str,
-    ) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
+    ) -> Result<Vec<(String, Option<f64>, Option<String>, Option<String>)>> {
         let pool = self.agg.database().pool().clone();
         crate::dao::list_chapters_for_series(&pool, series_id).await
     }
@@ -249,7 +249,7 @@ impl Touring {
     pub async fn list_episodes_for_series(
         &self,
         series_id: &str,
-    ) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
+    ) -> Result<Vec<(String, Option<f64>, Option<String>, Option<String>)>> {
         let pool = self.agg.database().pool().clone();
         crate::dao::list_episodes_for_series(&pool, series_id).await
     }
@@ -542,7 +542,7 @@ impl Touring {
 
         tokio::fs::create_dir_all(base_dir).await.ok();
 
-        for (chapter_id, number_num, number_text) in chapters {
+        for (chapter_id, number_num, number_text, upload_group) in chapters {
             processed += 1;
             let name = number_text
                 .or_else(|| number_num.map(|n| format!("{:.3}", n)))
@@ -589,7 +589,7 @@ impl Touring {
 
         tokio::fs::create_dir_all(base_dir).await.ok();
 
-        for (chapter_id, number_num, number_text) in chapters {
+        for (chapter_id, number_num, number_text, upload_group) in chapters {
             processed += 1;
             let name = number_text
                 .or_else(|| number_num.map(|n| format!("{:.3}", n)))
@@ -639,10 +639,10 @@ impl Touring {
         let total = chapters.len();
         let mut downloaded = 0;
 
-        for (_, number_num, number_text) in chapters
+        for (_, number_num, number_text, upload_group) in chapters
             .iter()
             .enumerate()
-            .map(|(_i, (id, num, text))| (id, num, text))
+            .map(|(_i, (id, num, text, upload_group))| (id, num, text, upload_group))
         {
             let name = number_text
                 .clone()

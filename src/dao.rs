@@ -39,8 +39,9 @@ pub struct ChapterInsert {
     pub number_num: Option<f64>,
     pub title: Option<String>,
     pub lang: Option<String>,
-    pub volume: Option<String>,
+    pub group: Option<String>,
     pub published_at: Option<String>, // ISO string
+    pub upload_group: Option<String>
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +66,7 @@ pub struct EpisodeInsert {
     pub lang: Option<String>,
     pub season: Option<String>,
     pub published_at: Option<String>,
+    pub group: Option<String>
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,8 +135,9 @@ pub async fn upsert_chapter(pool: &AnyPool, c: &ChapterInsert) -> Result<()> {
     .bind(&c.number_num)
     .bind(&c.title)
     .bind(&c.lang)
-    .bind(&c.volume)
+    .bind(&c.group)
     .bind(&c.published_at)
+    .bind(&c.upload_group)
     .execute(pool)
     .await?;
     Ok(())
@@ -173,6 +176,7 @@ pub async fn upsert_episode(pool: &AnyPool, e: &EpisodeInsert) -> Result<()> {
     .bind(&e.lang)
     .bind(&e.season)
     .bind(&e.published_at)
+    .bind(&e.group)
     .execute(pool)
     .await?;
     Ok(())
@@ -485,9 +489,9 @@ pub async fn list_series(pool: &AnyPool, kind: Option<&str>) -> Result<Vec<(Stri
 pub async fn list_chapters_for_series(
     pool: &AnyPool,
     series_id: &str,
-) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
-    let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>)>(
-        "SELECT id, number_num, number_text FROM chapters WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
+) -> Result<Vec<(String, Option<f64>, Option<String>, Option<String>)>> {
+    let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>, Option<String>)>(
+        "SELECT id, number_num, number_text, upload_group FROM chapters WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
     )
     .bind(series_id)
     .fetch_all(pool)
@@ -498,9 +502,9 @@ pub async fn list_chapters_for_series(
 pub async fn list_episodes_for_series(
     pool: &AnyPool,
     series_id: &str,
-) -> Result<Vec<(String, Option<f64>, Option<String>)>> {
-    let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>)>(
-        "SELECT id, number_num, number_text FROM episodes WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
+) -> Result<Vec<(String, Option<f64>, Option<String>, Option<String>)>> {
+    let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>, Option<String>)>(
+        "SELECT id, number_num, number_text, upload_group FROM episodes WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
     )
     .bind(series_id)
     .fetch_all(pool)

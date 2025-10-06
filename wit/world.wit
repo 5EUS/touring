@@ -59,6 +59,8 @@ world library {
     published-at: option<string>,
     /// The unit kind
     kind: unit-kind,
+    /// Uploader group
+    upload-group: option<string>
   }
 
   /// Generic asset exposed by a unit (page/image/audio/video/subtitle/file links).

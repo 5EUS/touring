@@ -68,7 +68,8 @@ pub fn chapter_insert_from_unit(
         number_num: u.number.map(|n| n as f64),
         title: Some(u.title.clone()).filter(|s| !s.is_empty()),
         lang: u.lang.clone(),
-        volume: u.group.clone(),
+        group: u.group.clone(),
         published_at: u.published_at.clone(),
+        upload_group: u.upload_group.clone()
     }
 }

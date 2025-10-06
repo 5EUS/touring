@@ -300,6 +300,7 @@ impl Aggregator {
                         lang: u.lang.clone(),
                         season: u.group.clone(),
                         published_at: u.published_at.clone(),
+                        group: u.upload_group.clone(),
                     };
                     let _ = dao::upsert_episode(&pool, &ep).await;
                 } else {
@@ -315,6 +316,7 @@ impl Aggregator {
                         lang: u.lang.clone(),
                         season: u.group.clone(),
                         published_at: u.published_at.clone(),
+                        group: u.upload_group.clone(),
                     };
                     let _ = dao::upsert_episode(&pool, &ep).await;
                 }
