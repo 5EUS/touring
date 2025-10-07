@@ -66,7 +66,7 @@ pub struct EpisodeInsert {
     pub lang: Option<String>,
     pub season: Option<String>,
     pub published_at: Option<String>,
-    pub group: Option<String>
+    pub upload_group: Option<String>
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +125,7 @@ pub async fn upsert_series_source(pool: &AnyPool, ss: &SeriesSourceInsert) -> Re
 
 pub async fn upsert_chapter(pool: &AnyPool, c: &ChapterInsert) -> Result<()> {
     sqlx::query(
-        "INSERT INTO chapters(\n            id, series_id, source_id, external_id, number_text, number_num, title, lang, volume, published_at\n         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n         ON CONFLICT(series_id, source_id, external_id) DO UPDATE SET\n           id=excluded.id, number_text=excluded.number_text, number_num=excluded.number_num,\n           title=excluded.title, lang=excluded.lang, volume=excluded.volume,\n           published_at=excluded.published_at, updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO chapters(\n            id, series_id, source_id, external_id, number_text, number_num, title, lang, volume, published_at, upload_group\n         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n         ON CONFLICT(series_id, source_id, external_id) DO UPDATE SET\n           id=excluded.id, number_text=excluded.number_text, number_num=excluded.number_num,\n           title=excluded.title, lang=excluded.lang, volume=excluded.volume,\n           published_at=excluded.published_at, updated_at=CURRENT_TIMESTAMP",
     )
     .bind(&c.id)
     .bind(&c.series_id)
@@ -164,7 +164,7 @@ pub async fn upsert_chapter_images(pool: &AnyPool, images: &[ChapterImageInsert]
 
 pub async fn upsert_episode(pool: &AnyPool, e: &EpisodeInsert) -> Result<()> {
     sqlx::query(
-        "INSERT INTO episodes(\n            id, series_id, source_id, external_id, number_text, number_num, title, lang, season, published_at\n         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n         ON CONFLICT(series_id, source_id, external_id) DO UPDATE SET\n           id=excluded.id, number_text=excluded.number_text, number_num=excluded.number_num,\n           title=excluded.title, lang=excluded.lang, season=excluded.season,\n           published_at=excluded.published_at, updated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO episodes(\n            id, series_id, source_id, external_id, number_text, number_num, title, lang, season, published_at, upload_group\n         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n         ON CONFLICT(series_id, source_id, external_id) DO UPDATE SET\n           id=excluded.id, number_text=excluded.number_text, number_num=excluded.number_num,\n           title=excluded.title, lang=excluded.lang, season=excluded.season,\n           published_at=excluded.published_at, updated_at=CURRENT_TIMESTAMP",
     )
     .bind(&e.id)
     .bind(&e.series_id)
@@ -176,7 +176,7 @@ pub async fn upsert_episode(pool: &AnyPool, e: &EpisodeInsert) -> Result<()> {
     .bind(&e.lang)
     .bind(&e.season)
     .bind(&e.published_at)
-    .bind(&e.group)
+    .bind(&e.upload_group)
     .execute(pool)
     .await?;
     Ok(())
