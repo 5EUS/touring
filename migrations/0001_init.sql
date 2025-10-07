@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS chapters (
   lang          TEXT,
   volume        TEXT,
   published_at  DATETIME,
+  upload_group  TEXT,                      -- e.g., "scanlation group"
   created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(series_id, source_id, external_id),
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS episodes (
   lang          TEXT,
   season        TEXT,
   published_at  DATETIME,
+  upload_group  TEXT,
   created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(series_id, source_id, external_id),
