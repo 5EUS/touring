@@ -161,6 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(g) = &u.group { println!("    group: {}", g); }
                     if let Some(p) = &u.published_at { println!("    published: {}", p); }
                     if let Some(uurl) = &u.url { println!("    url: {}", uurl); }
+                    if let Some(ug) = &u.upload_group { println!("    upload group: {}", ug); }
                 }
             }
         }
