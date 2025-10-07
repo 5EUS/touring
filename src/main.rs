@@ -307,7 +307,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if !chapters.is_empty() {
                     println!("Downloading {} chapters to {}...", chapters.len(), base_out.display());
-                    for (cid, number_num, number_text, upload_group) in chapters {
+                    for (cid, number_num, number_text, upload_group, _title) in chapters {
                         let name = number_text.clone().or_else(|| number_num.map(|n| format!("{:.3}", n))).unwrap_or_else(|| "chapter".to_string());
                         let ch_out = if cbz {
                             base_out.join(format!("{}.cbz", name))
@@ -325,7 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Done.");
                 } else if !episodes.is_empty() {
                     println!("Downloading {} episodes to {}...", episodes.len(), base_out.display());
-                    for (eid, number_num, number_text, upload_group) in episodes {
+                    for (eid, number_num, number_text, upload_group, _title) in episodes {
                         let name = number_text.clone().or_else(|| number_num.map(|n| format!("{:.3}", n))).unwrap_or_else(|| "episode".to_string());
                         let ep_out = base_out.join(format!("{}.txt", name));
                         let streams = rt.block_on(touring.get_episode_streams(&eid))?;

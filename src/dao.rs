@@ -489,9 +489,9 @@ pub async fn list_series(pool: &AnyPool, kind: Option<&str>) -> Result<Vec<(Stri
 pub async fn list_chapters_for_series(
     pool: &AnyPool,
     series_id: &str,
-) -> Result<Vec<(String, Option<f64>, Option<String>, Option<String>)>> {
-    let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>, Option<String>)>(
-        "SELECT id, number_num, number_text, upload_group FROM chapters WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
+) -> Result<Vec<(String, Option<f64>, Option<String>, Option<String>, Option<String>)>> {
+    let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT id, number_num, number_text, title, upload_group FROM chapters WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
     )
     .bind(series_id)
     .fetch_all(pool)
@@ -502,9 +502,9 @@ pub async fn list_chapters_for_series(
 pub async fn list_episodes_for_series(
     pool: &AnyPool,
     series_id: &str,
-) -> Result<Vec<(String, Option<f64>, Option<String>, Option<String>)>> {
-    let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>, Option<String>)>(
-        "SELECT id, number_num, number_text, upload_group FROM episodes WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
+) -> Result<Vec<(String, Option<f64>, Option<String>, Option<String>, Option<String>)>> {
+    let rows = sqlx::query_as::<_, (String, Option<f64>, Option<String>, Option<String>, Option<String>)>(
+        "SELECT id, number_num, number_text, title, upload_group FROM episodes WHERE series_id = ? ORDER BY number_num NULLS LAST, number_text",
     )
     .bind(series_id)
     .fetch_all(pool)
