@@ -305,6 +305,16 @@ impl Touring {
         Ok(())
     }
 
+    pub async fn clear_series_progress(&self, series_id: &str) -> Result<u64> {
+        let pool = self.agg.database().pool().clone();
+        let deleted = sqlx::query("DELETE FROM chapter_progress WHERE series_id = ?")
+            .bind(series_id)
+            .execute(&pool)
+            .await?
+            .rows_affected();
+        Ok(deleted)
+    }
+
     pub async fn get_series_download_path(&self, series_id: &str) -> Result<Option<String>> {
         let pool = self.agg.database().pool().clone();
         Ok(crate::dao::get_series_pref(&pool, series_id)
